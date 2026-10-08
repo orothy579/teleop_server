@@ -1,0 +1,16 @@
+[Unit]
+Description=teleop_server: cameras, arms, base, recording (http://<host>:8080)
+Wants=teleop-slate.service
+After=teleop-slate.service
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/home/midbar/ws/teleop_server/teleop_server/deploy/run_server.sh
+Restart=always
+RestartSec=5
+# SIGINT = graceful: zero base velocity, finish/mark recording, staged->sleep arm motion.
+KillSignal=SIGINT
+TimeoutStopSec=300
+
+[Install]
+WantedBy=default.target

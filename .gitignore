@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.cache/
+.venv/
+edge.env
+edge_runtime/
+dataset/
+capture_tools/outputs/
+artifacts/

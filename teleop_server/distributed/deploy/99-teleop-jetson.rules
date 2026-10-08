@@ -1,0 +1,2 @@
+# Match only this SLATE serial device; user services can open it before a new login.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", ATTRS{serial}=="chassis", OWNER="midbar", GROUP="dialout", MODE="0660", SYMLINK+="slate"

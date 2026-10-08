@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teleop Monitor</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>Teleop Monitor</h1>
+  <div class="conn">
+    <span id="conn" class="pill" data-state="connecting">연결 중</span>
+    <span class="metric"><span class="k">RTT</span> <span id="rtt">–</span></span>
+    <span class="metric"><span class="k">시계 오프셋</span> <span id="offset">–</span></span>
+  </div>
+</header>
+
+<main>
+  <section class="control card" aria-labelledby="h-ctl">
+    <h2 id="h-ctl" class="sr-only">제어와 녹화</h2>
+    <div class="ctl-row">
+      <div class="ctl-group">
+        <span class="ctl-label">로봇 제어</span>
+        <span id="arm-state" class="status" data-s="off"><i>–</i><span>정지</span></span>
+        <button id="btn-control" class="btn primary" type="button" disabled>제어 시작</button>
+      </div>
+      <div class="ctl-group ctl-rec">
+        <span class="ctl-label">녹화</span>
+        <span id="rec-state" class="status" data-s="off"><i>–</i><span>사용 불가</span></span>
+        <button id="btn-record" class="btn rec" type="button" disabled><span class="dot" aria-hidden="true"></span><span class="lbl">녹화 시작</span></button>
+        <span id="rec-meta" class="metric"></span>
+      </div>
+    </div>
+    <div id="ctl-msg" class="ctl-msg" role="alert" hidden></div>
+    <div class="rec-last"><span id="rec-last"></span>
+      <button id="btn-labels" class="mini" type="button" hidden>라벨 입력</button></div>
+  </section>
+
+  <section aria-labelledby="h-cams">
+    <div class="sec-head">
+      <h2 id="h-cams">카메라</h2>
+      <div class="cam-tools" role="toolbar" aria-label="카메라 배치">
+        <button class="mini" id="lay-edit" type="button" aria-pressed="false"
+          title="끌어서 이동, 오른쪽 아래 손잡이로 크기 조절. 키보드: 화살표 이동, + / - 크기">배치 편집</button>
+        <select id="lay-preset" class="mini-select" aria-label="배치 미리 설정">
+          <option value="">배치 선택…</option>
+          <option value="row">가로 3분할</option>
+          <option value="big1">카메라 1 크게</option>
+          <option value="big2">카메라 2 크게</option>
+          <option value="big3">카메라 3 크게</option>
+          <option value="stack">세로로 쌓기</option>
+        </select>
+        <button class="mini" id="lay-reset" type="button">기본 배치</button>
+      </div>
+    </div>
+    <div class="cams" id="cams"></div>
+  </section>
+
+  <section aria-labelledby="h-arms">
+    <h2 id="h-arms">팔 관절 상태 <span class="sub">리더 · 팔로워 위치 (rad, 그리퍼 mm)</span></h2>
+    <div class="arms" id="arms"></div>
+  </section>
+
+  <section aria-labelledby="h-base">
+    <h2 id="h-base">모바일 베이스 <span class="sub">odometry · 궤적 · 가상 컨트롤러는 떠 있는 창</span></h2>
+    <div class="base card">
+      <dl class="kv" id="odom-kv"></dl>
+      <div class="traj-wrap"><canvas id="traj" aria-label="베이스 궤적 (위에서 본 x-y)"></canvas><div class="traj-note" id="traj-note">최근 60초 궤적 · 격자 1 m</div></div>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-lat">
+    <h2 id="h-lat">센서별 지연 <span class="sub">최근 10초 · 종단 지연 = 센서 시각 → 브라우저 표시</span></h2>
+    <div class="card table-wrap">
+      <table class="lat" id="lat">
+        <thead>
+          <tr>
+            <th scope="col">센서</th><th scope="col">상태</th><th scope="col" class="num">Hz</th>
+            <th scope="col" class="num" title="센서 시각 → 서버 수신">센서 p50</th>
+            <th scope="col" class="num" title="서버 수신 → 웹소켓 전송">서버 p50</th>
+            <th scope="col" class="num" title="웹소켓 전송 → 브라우저 수신 (시계 보정)">네트워크 p50</th>
+            <th scope="col" class="num" title="브라우저 수신 → 화면 그리기 완료">렌더 p50</th>
+            <th scope="col" class="num">종단 p50</th><th scope="col" class="num">종단 p95</th><th scope="col" class="num">종단 최대</th>
+            <th scope="col" class="num" title="서버에서 최신값으로 대체되어 전송되지 않은 메시지">누락</th>
+            <th scope="col" class="spark-col">종단 p50 추이 (60초)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="legend-note">상태 기준: 종단 p95 <span id="thr-good"></span> 미만 정상 · <span id="thr-warn"></span> 미만 주의 · 그 이상 또는 1초 이상 수신 없음은 위험.
+      팔은 컨트롤러 시계를 최소 오프셋으로 맞추므로 센서 지연이 하한값입니다.</p>
+  </section>
+</main>
+<aside id="joy-float" class="joy-float" aria-label="모바일 베이스 가상 컨트롤러" hidden>
+  <div class="joy-head" id="joy-drag" title="끌어서 이동">
+    <span class="ctl-label">베이스 컨트롤러</span>
+    <span id="base-state" class="status" data-s="off"><i>–</i><span>사용 불가</span></span>
+    <button class="mini" id="joy-min" type="button" aria-expanded="true" aria-controls="joy-body" title="접기">접기</button>
+  </div>
+  <div class="joy-body" id="joy-body">
+    <div class="joy-pad disabled" id="joy-pad" role="application" aria-label="베이스 조이스틱: 로봇 제어 중, 누르고 있는 동안만 이동">
+      <span class="jh up">전진</span><span class="jh down">후진</span><span class="jh left">좌회전</span><span class="jh right">우회전</span>
+      <div class="joy-knob" id="joy-knob"></div>
+    </div>
+    <label class="speed">속도 <input id="joy-speed" type="range" min="10" max="100" step="10" value="50">
+      <span id="joy-speed-val">50%</span></label>
+    <label class="speed">투명도 <input id="joy-alpha" type="range" min="0" max="80" step="5" value="15">
+      <span id="joy-alpha-val">15%</span></label>
+    <div class="joy-read" id="joy-read">–</div>
+    <p class="joy-help">로봇 제어 중, 누르는 동안만 움직입니다. 키보드 W·S·A·D 또는 방향키.</p>
+  </div>
+</aside>
+<dialog id="label-dialog" class="dialog" aria-labelledby="ld-title">
+  <form id="ld-form" class="label-form dialog-form" method="dialog" autocomplete="off">
+    <div class="dialog-head">
+      <h2 id="ld-title">녹화 라벨</h2>
+      <span id="ld-summary" class="metric"></span>
+    </div>
+    <label class="f wide" id="ld-pick" hidden>세션 <select id="ld-session"></select></label>
+    <fieldset class="outcome"><legend>결과</legend>
+      <label><input type="radio" name="ld-outcome" value="success"> 성공</label>
+      <label><input type="radio" name="ld-outcome" value="failure"> 실패</label>
+    </fieldset>
+    <label class="f wide">작업명 <input id="ld-task" type="text" maxlength="300"
+      placeholder="예: pick up box with left arm"></label>
+    <label class="f">환경명 <input id="ld-env" type="text" maxlength="200" placeholder="예: 실험실 책상 A, 형광등"></label>
+    <label class="f">작업자 <input id="ld-op" type="text" maxlength="100"></label>
+    <label class="f wide">설명 <textarea id="ld-notes" rows="3" maxlength="4000"
+      placeholder="잘된 점, 실수, 특이사항 등 데이터에 대한 설명"></textarea></label>
+    <p class="wide ld-note">작업명은 이 녹화의 작업 문장(task)으로 데이터셋에 저장됩니다.</p>
+    <div class="actions">
+      <button class="btn primary" type="submit" id="ld-save" value="save">라벨 저장</button>
+      <button class="btn" type="button" id="ld-later">나중에</button>
+      <span id="ld-msg" class="lb-msg" role="status"></span>
+    </div>
+  </form>
+</dialog>
+<div id="tooltip" class="tooltip" role="status" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

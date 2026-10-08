@@ -1,0 +1,20 @@
+# Files the Jetson edge (teleop-jetson, teleop-jetson-slate) actually runs, relative to the
+# Git checkout ~/ws/teleop_server. build_jetson_runtime.sh copies these to edge_runtime/.
+teleop_server/__init__.py
+teleop_server/base_control.py
+teleop_server/hub.py
+teleop_server/latency.py
+teleop_server/server.py
+teleop_server/sources/__init__.py
+teleop_server/sources/base.py
+teleop_server/sources/arms.py
+teleop_server/sources/camera.py
+teleop_server/sources/odom.py
+teleop_server/distributed/__init__.py
+teleop_server/distributed/edge.py
+teleop_server/distributed/protocol.py
+teleop_server/distributed/local_recorder.py
+teleop_server/distributed/deploy/run_edge.sh
+teleop_server/distributed/deploy/run_slate.sh
+teleop_server/distributed/deploy/teleop-jetson.service
+teleop_server/distributed/deploy/teleop-jetson-slate.service

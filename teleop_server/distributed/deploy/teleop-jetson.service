@@ -1,0 +1,16 @@
+[Unit]
+Description=Jetson RGB-depth and robot collector for DGX
+After=network-online.target teleop-jetson-slate.service
+Wants=network-online.target teleop-jetson-slate.service
+
+[Service]
+Type=simple
+EnvironmentFile=/home/midbar/ws/teleop_jetson/edge.env
+ExecStart=/bin/bash /home/midbar/ws/teleop_server/edge_runtime/teleop_server/distributed/deploy/run_edge.sh
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

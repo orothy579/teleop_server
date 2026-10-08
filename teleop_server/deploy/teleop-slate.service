@@ -1,0 +1,13 @@
+[Unit]
+Description=Trossen SLATE base ROS driver (teleop_server)
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/home/midbar/ws/teleop_server/teleop_server/deploy/run_slate_driver.sh
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

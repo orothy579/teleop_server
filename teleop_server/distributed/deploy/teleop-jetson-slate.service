@@ -1,0 +1,14 @@
+[Unit]
+Description=Jetson SLATE base driver (isolated ROS domain 42)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /home/midbar/ws/teleop_server/edge_runtime/teleop_server/distributed/deploy/run_slate.sh
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

@@ -3,6 +3,9 @@
 Real mode uses the same lerobot Trossen classes as the existing collectors, so connecting MOVES
 every arm to its staged pose, followers then track the leaders, and a normal stop performs the
 staged -> sleep disconnect motion. After a fault only ``driver.cleanup()`` is attempted.
+
+After a policy (AI) run the followers hold their pose; ``return_to_teleop`` moves all four arms back
+to the staged pose together and resumes teleop, the same state as right after connecting.
 """
 import logging
 import math
@@ -11,10 +14,12 @@ import time
 
 from teleop_server.latency import MinOffsetClock
 from teleop_server.sources.base import Source
+from teleop_server.policy_control import PolicyControl
 
 log = logging.getLogger(__name__)
 SIDES = ("left", "right")
 JOINT_NAMES = [*(f"joint_{i}" for i in range(6)), "left_carriage_joint"]
+STAGED = [0.0, math.pi / 3, math.pi / 6, math.pi / 5, 0.0, 0.0, 0.0]  # lerobot Trossen default (rad, gripper m)
 
 
 class Reading:
@@ -48,6 +53,25 @@ class RealArm:
         sent = self.dev.send_action({f"{n}.pos": p for n, p in zip(JOINT_NAMES, positions)})
         return [sent[f"{n}.pos"] for n in JOINT_NAMES]
 
+    @property
+    def staged(self):
+        return list(self.dev.config.staged_positions)
+
+    # Leaders are gravity-compensated (moved by hand); to move one, switch it to position control.
+    def position_mode(self, hold):
+        import trossen_arm
+        self.dev.driver.set_all_modes(trossen_arm.Mode.position)
+        self.move(hold)
+
+    def move(self, positions):
+        self.dev.driver.set_all_positions(list(positions), goal_time=0.1, blocking=False)
+        return list(positions)
+
+    def gravity_mode(self):  # as lerobot's leader configure(): external effort 0 = gravity compensation
+        import trossen_arm
+        self.dev.driver.set_all_modes(trossen_arm.Mode.external_effort)
+        self.dev.driver.set_all_external_efforts([0.0] * len(JOINT_NAMES), goal_time=0.0, blocking=True)
+
     def close(self, fault):
         if fault:
             self.dev.driver.cleanup()  # no motion after a fault
@@ -65,6 +89,9 @@ class FakeArm:
         self.target = [0.0] * 7
         self.t0 = self.last = None
         self.connected = False
+        self.held = False  # leader under position control (not moved by hand)
+        self.offset = [0.0] * 7  # a released leader continues its motion from where it was held
+        self.staged = list(STAGED)
 
     def connect(self):
         self.t0 = self.last = time.monotonic()
@@ -76,8 +103,8 @@ class FakeArm:
         now = time.monotonic()
         t = now - self.t0
         phase = 0.0 if self.side == "left" else 1.0
-        if self.role == "leader":
-            self.pos = [0.4 * math.sin(0.5 * t + phase + i) for i in range(6)] + [0.02 + 0.015 * math.sin(0.8 * t + phase)]
+        if self.role == "leader" and not self.held:
+            self.pos = [o + v for o, v in zip(self.offset, self._hand(t, phase))]
         else:
             a = min(1.0, (now - self.last) / 0.05)
             self.pos = [p + a * (g - p) for p, g in zip(self.pos, self.target)]
@@ -86,12 +113,54 @@ class FakeArm:
         ts_us = int((now - self.t0 - lag) * 1e6)
         return Reading(list(self.pos), [0.0] * 7, [0.0] * 7, ts_us)
 
+    @staticmethod
+    def _hand(t, phase):  # the operator's simulated hand motion
+        return [0.4 * math.sin(0.5 * t + phase + i) for i in range(6)] + [0.02 + 0.015 * math.sin(0.8 * t + phase)]
+
     def command(self, positions):
         self.target = list(positions)
         return list(positions)
 
+    def position_mode(self, hold):
+        self.held = True
+        self.move(hold)
+
+    def move(self, positions):
+        self.target = list(positions)
+        return list(positions)
+
+    def gravity_mode(self):
+        t = time.monotonic() - self.t0
+        self.offset = [p - v for p, v in zip(self.pos, self._hand(t, 0.0 if self.side == "left" else 1.0))]
+        self.held = False
+
     def close(self, fault):
         self.connected = False
+
+
+class ReturnMotion:
+    """All arms from where they are to their staged pose along one smooth (smoothstep) path.
+
+    The slowest joint sets the duration: on average at most ``speed`` rad/s (peak 1.5x), never
+    shorter than lerobot's own 2 s staged move. ``settle`` keeps commanding the staged pose briefly so
+    the arms are there before the leaders are released.
+    """
+
+    def __init__(self, starts, goals, now, speed=0.5, min_s=2.0, max_s=8.0, settle=0.4):
+        self.starts, self.goals, self.t0 = starts, goals, now
+        far = max((abs(g - s) for k in starts for i, (s, g) in enumerate(zip(starts[k], goals[k])) if i != 6), default=0.0)
+        self.duration, self.settle = min(max_s, max(min_s, far / speed)), settle
+
+    def progress(self, now):
+        return min(1.0, max(0.0, (now - self.t0) / self.duration))
+
+    def at(self, key, now):
+        x = self.progress(now)
+        x = x * x * (3 - 2 * x)
+        return [s + x * (g - s) for s, g in zip(self.starts[key], self.goals[key])]
+
+    def finished(self, now):
+        return now - self.t0 >= self.duration + self.settle
 
 
 class Cycle:
@@ -120,8 +189,11 @@ class ArmSource(Source):
         self.arms = {}
         self.rate, self.telemetry_hz, self.teleop, self.autostart = rate, telemetry_hz, teleop, autostart
         self.control_lock = threading.Lock()
+        self.policy = PolicyControl()
         self.cycle_sink = None
         self.exit_hooks = []
+        self.teleop_hooks = []  # called on the arm thread when teleop resumes after a return
+        self.motion = None
         self.loop_overruns = 0
         self.cycles = 0
         self.info = {"rate_hz": rate, "teleop": teleop}
@@ -138,6 +210,8 @@ class ArmSource(Source):
             if self.thread is not None and self.thread.is_alive():
                 raise RuntimeError(f"arm control is already {self.state}")
             self.stop_event = threading.Event()
+            self.policy.reset()
+            self.motion = None
             self.error = None
             self.arms = self.make_arms()
             self.clocks = {k: MinOffsetClock() for k in self.arms}
@@ -149,6 +223,51 @@ class ArmSource(Source):
     def stop_control(self):
         """Request a normal stop (staged -> sleep motion); returns immediately."""
         self.stop_event.set()
+
+    def start_policy(self, owner, settings=None):
+        with self.policy.lock:
+            if self.state != "running" or self.stop_event.is_set() or not self.teleop:
+                raise RuntimeError("connect the arms and wait for running state first")
+            configured = self.policy.validated_settings(settings)
+            if configured["command_hz"] > self.rate:
+                raise ValueError("policy command frequency exceeds the arm loop rate")
+            self.policy.begin(owner, settings=configured)
+
+    def return_to_teleop(self):
+        """After a policy run: move every arm back to the staged pose, then resume teleop."""
+        with self.policy.lock:
+            if self.state != "running" or self.stop_event.is_set() or not self.teleop:
+                raise RuntimeError("arm control is not running")
+            self.policy.start_return()
+            return self.policy.status()
+
+    def _return_step(self, fol, lead, now):
+        """One cycle of the return motion (policy lock held); returns the follower commands."""
+        if self.motion is None:  # first cycle: leaders hold where they are, then all four move together
+            starts = {("follower", side): fol[side][0].pos for side in SIDES}
+            starts.update({("leader", side): lead[side][0].pos for side in SIDES})
+            for side in SIDES:
+                self.arms[("leader", side)].position_mode(starts[("leader", side)])
+            self.motion = ReturnMotion(starts, {k: self.arms[k].staged for k in starts}, now)
+            log.info("arms returning to the staged pose (%.1f s)", self.motion.duration)
+        sent = {}
+        for side in SIDES:
+            sent[side] = self.arms[("follower", side)].command(self.motion.at(("follower", side), now))
+            self.arms[("leader", side)].move(self.motion.at(("leader", side), now))
+        self.info["return"] = dict(progress=round(self.motion.progress(now), 3), duration_s=round(self.motion.duration, 2))
+        if self.motion.finished(now):
+            for side in SIDES:
+                self.arms[("leader", side)].gravity_mode()
+            self.motion = None
+            self.info.pop("return", None)
+            self.policy.finish_return()
+            log.info("arms at the staged pose; teleop resumed")
+            for hook in self.teleop_hooks:
+                try:
+                    hook()
+                except Exception:
+                    log.exception("teleop hook failed")
+        return sent
 
     def stop(self, timeout=60.0):  # server shutdown; staged/sleep disconnect of four arms takes ~16 s
         super().stop(timeout)
@@ -191,9 +310,17 @@ class ArmSource(Source):
                 fol = {side: self._read(("follower", side)) for side in SIDES}
                 lead = {side: self._read(("leader", side)) for side in SIDES}
                 sent = {}
-                if self.teleop:
-                    for side in SIDES:
-                        sent[side] = self.arms[("follower", side)].command(lead[side][0].pos)
+                with self.policy.lock:
+                    self.policy.observe([*fol["left"][0].pos, *fol["right"][0].pos])
+                    if self.teleop and self.policy.mode == "returning":
+                        sent = self._return_step(fol, lead, time.monotonic())
+                    else:
+                        targets = self.policy.command(period)
+                        if self.teleop:
+                            for index, side in enumerate(SIDES):
+                                positions = lead[side][0].pos if targets is None else targets[index*7:(index+1)*7]
+                                sent[side] = self.arms[("follower", side)].command(positions)
+                    self.info["policy"] = self.policy.status()
                 end_ns = time.monotonic_ns()
                 for side in SIDES:
                     self._publish(("leader", side), lead[side])

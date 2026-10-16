@@ -35,6 +35,21 @@ MANIFEST, READY = "manifest.json", "READY"
 CAMERA_MAX_AGE_NS = 500_000_000  # same limits as the DGX recorder
 MAX_DEPTH_DT_MS = 2.0
 MAX_BASE_AGE_NS = 250_000_000
+START_MAX_AGE_NS = 1_000_000_000  # start check: is the input arriving at all?
+STALL_S = 1.0  # recording but nothing stored for this long: the status says why
+# Why a cycle was not stored, for the operator (also used for an empty session's error on the DGX).
+SKIP_HINTS = {
+    "odometry too old": "베이스(SLATE) odometry가 들어오지 않습니다. SLATE 전원과 드라이버를 확인하세요.",
+    "odometry frame IDs changed": "베이스 odometry 좌표계 이름이 바뀌었습니다.",
+    "camera frame too old": "카메라 프레임이 들어오지 않거나 늦습니다.",
+    "missing or unpaired RGB/depth": "RGB와 depth 짝이 맞는 카메라 프레임이 없습니다.",
+    "writer behind": "Jetson 저장이 밀리고 있습니다.",
+    "arm control not running": "팔 제어가 꺼져 있습니다.",
+}
+
+
+def skip_hint(reason):
+    return SKIP_HINTS.get(reason, reason)
 RESYNC_CYCLES = 15  # buffered sampling: one frame behind for this long -> jump to the newest
 SAMPLING = {
     "buffered": "per camera the oldest paired frame not yet recorded (at most 1 frame behind the newest; "
@@ -178,9 +193,12 @@ class Recording:
         self.t_stop = None
         self.start_unix_ns, self.start_monotonic_ns = time.time_ns(), time.monotonic_ns()
         self.manifest = {}
+        self.last_stored = self.t0   # monotonic time of the last stored frame (or the start)
+        self.last_skip = None        # reason of the latest skipped cycle
 
     def skip(self, reason):
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
+        self.last_skip = reason
 
     def event(self, text):
         if len(self.events) < 1000 and (not self.events or self.events[-1]["event"] != text):
@@ -220,7 +238,23 @@ class LocalRecorder:
         if r is not None:
             d.update(session=r.name, task=r.task, frames=r.frames, skipped=dict(r.skipped),
                      elapsed_s=round(r.elapsed, 2))
+            idle = time.monotonic()-r.last_stored
+            if self.state == "recording" and idle > STALL_S and r.last_skip:
+                d["stalled"] = {"for_s": round(idle, 1), "reason": r.last_skip, "hint": skip_hint(r.last_skip)}
         return d
+
+    def input_problem(self):
+        """Why a recording started now would store nothing (None: inputs are arriving)."""
+        now = time.time_ns()
+        for cam in self.cameras:
+            f = cam.latest_frame(paired=True)
+            if f is None or not 0 <= now-f.t_recv_ns <= START_MAX_AGE_NS:
+                return f"{cam.name}: RGB/depth 프레임이 들어오지 않습니다."
+        base = self.base_capture.snapshot(drain=False)
+        odom = base["odom"]
+        if odom is None or not 0 <= base["now_ns"]-odom["receive_ns"] <= START_MAX_AGE_NS:
+            return SKIP_HINTS["odometry too old"]
+        return None
 
     # ---------- start ----------
     def _new_dir(self):
@@ -242,6 +276,9 @@ class LocalRecorder:
             free = shutil.disk_usage(self.root).free
             if free < self.min_free_bytes:
                 raise RuntimeError(f"Jetson disk almost full ({free / 1e9:.0f} GB free)")
+            problem = self.input_problem()
+            if problem:  # every cycle would be skipped: refuse instead of recording nothing
+                raise RuntimeError(f"녹화를 시작하지 않았습니다: {problem}")
             calibration = {}
             for cam in self.cameras:
                 scale = cam.info.get("depth_scale_m")
@@ -313,6 +350,7 @@ class LocalRecorder:
                                          for cam, f in zip(self.cameras, frames)],
                              "base": {"odom": odom, "command": base["command"], "now_ns": base["now_ns"]}})
             rec.frames += 1
+            rec.last_stored = time.monotonic()
             for cam, f in zip(self.cameras, frames):  # consumed only once the cycle is recorded
                 rec.last_seq[cam.name] = f.seq
             rec.behind.update(behind)

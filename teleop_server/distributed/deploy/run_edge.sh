@@ -5,5 +5,6 @@ cd /home/midbar/ws/teleop_server/edge_runtime
 source /opt/ros/jazzy/setup.bash
 export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=1 ROS_LOG_DIR=/tmp/teleop-jetson-ros
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# Use the DGX's stable Tailscale address so the edge works across unrelated Wi-Fi networks.
 exec /home/midbar/ws/teleop_jetson/.venv/bin/python -B -m teleop_server.distributed.edge \
-  --dgx http://192.168.0.104:8081 --arms teleop --rgb-codec jpeg "$@"
+  --dgx http://100.127.107.103:8081 --arms teleop --rgb-codec jpeg "$@"

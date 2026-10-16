@@ -22,6 +22,7 @@ GAP_LOG_S = 0.5  # control gaps longer than this are logged and counted (diagnos
 MAX_PACKET = 32 * 1024 * 1024
 MAX_HEADER = 4 * 1024 * 1024
 MAX_PIXELS = 640 * 480
+PREVIEW_JPEG_QUALITY = 85  # Live view only; the Jetson recorder uses the original RGB frames.
 
 
 def encode_camera(name, frame, info, rgb_codec="png", depth_compressor="lz4"):
@@ -32,7 +33,8 @@ def encode_camera(name, frame, info, rgb_codec="png", depth_compressor="lz4"):
     """
     started = time.perf_counter()
     bgr = cv2.cvtColor(frame.rgb, cv2.COLOR_RGB2BGR)
-    options = [cv2.IMWRITE_PNG_COMPRESSION, 1] if rgb_codec == "png" else [cv2.IMWRITE_JPEG_QUALITY, 95]
+    options = ([cv2.IMWRITE_PNG_COMPRESSION, 1] if rgb_codec == "png" else
+               [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
     ok, rgb = cv2.imencode(".png" if rgb_codec == "png" else ".jpg", bgr, options)
     if not ok:
         raise ValueError("RGB encoding failed")
@@ -144,7 +146,7 @@ def encode_packet(meta, frames, rgb_codec="png", depth_compressor="lz4"):
     return pack_packet(dict(meta, encode_ms=(time.perf_counter()-started)*1000), encoded)
 
 
-def decode_packet(data):
+def decode_packet(data, with_encoded_rgb=False):
     if not 4 <= len(data) <= MAX_PACKET:
         raise ValueError("invalid packet size")
     n, = struct.unpack_from("<I", data)
@@ -176,7 +178,8 @@ def decode_packet(data):
         from PIL import Image
         from io import BytesIO
         with Image.open(BytesIO(rgb_data)) as im:
-            if im.size != (w, h) or im.format not in ("PNG", "JPEG"):
+            if (im.size != (w, h) or im.format not in ("PNG", "JPEG") or
+                    im.format != cam.get("rgb_codec", "png").upper()):
                 raise ValueError("encoded dimensions mismatch")
         bgr = cv2.imdecode(np.frombuffer(rgb_data, np.uint8), cv2.IMREAD_COLOR)
         if bgr is None or bgr.shape != (h, w, 3):
@@ -189,7 +192,8 @@ def decode_packet(data):
                 raise ValueError("invalid depth dimensions")
             depth = decode_depth(payload[offset+nr:end], cam.get("depth_codec"), (dh, dw),
                                  cam["info"].get("depth_scale_m"))
-        frames[name] = (cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), depth, cam)
+        decoded = (cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), depth, cam)
+        frames[name] = (*decoded, bytes(rgb_data)) if with_encoded_rgb else decoded
     if end != len(payload):
         raise ValueError("unexpected trailing bytes")
     return meta, frames

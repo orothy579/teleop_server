@@ -11,6 +11,7 @@ import uuid
 from collections import deque
 
 import numpy as np
+import cv2
 from concurrent.futures import ThreadPoolExecutor
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType
@@ -19,14 +20,15 @@ from teleop_server.base_control import BaseController, FakeTwistPublisher, RosTw
 from teleop_server.latency import StatsRegistry
 from teleop_server.server import build_sources, parse_args as sensor_args
 from teleop_server.sources.odom import OdomSourceBase
-from teleop_server.sources.camera import FakeCamera, RealSenseCamera
+from teleop_server.sources.camera import CameraFrame, FakeCamera, RealSenseCamera
 from .local_recorder import MANIFEST, LocalRecorder
 from .protocol import GAP_LOG_S, LINK_TIMEOUT_S, MAX_PACKET, encode_camera, pack_packet
 
 log = logging.getLogger(__name__)
 # Commands that start motion are dropped when they arrive late (never replayed after a stall);
 # commands that stop something are always executed, however late.
-EXPIRING_COMMANDS = {"control_start", "base_enable", "base_cmd", "record_start"}
+EXPIRING_COMMANDS = {"control_start", "base_enable", "base_cmd", "record_start", "policy_start", "policy_target",
+                     "arms_return"}
 
 
 class PresentRealSenseCamera(RealSenseCamera):
@@ -194,6 +196,7 @@ class Edge:
                                    jpeg_quality=sensors.jpeg_quality, scale=sensors.scale, depth=sensors.depth)
                 for i in range(3)]
         sensors.odom = odom_mode
+        self.fake_base = odom_mode == "fake"
         self.cameras = [s for s in self.sources if s.kind == "camera"]
         self.arms = next(s for s in self.sources if s.kind == "arms")
         self.base_capture = (FakeBaseCapture(self.hub, self.stats) if odom_mode == "fake" else
@@ -204,6 +207,7 @@ class Edge:
         self.base = BaseController(self.hub, publisher, sensors.base_max_linear, sensors.base_max_angular)
         # Robot control is one unit: control_start enables the base, any end of arm control disables it.
         self.arms.exit_hooks.append(lambda error: self.base.disable("robot control stopped"))
+        self.arms.teleop_hooks.append(self.base.enable)  # back from AI control: as after control_start
         self.link_fault = threading.Event()
         original_make = self.arms.make_arms
         def make_arms():
@@ -222,8 +226,13 @@ class Edge:
         self.cycle_count = 0
         self.stream_tick = 0
         self.uploading = False
-        # While recording or uploading, the live view gets every Nth cycle (CPU and Wi-Fi go to the data).
+        # RGB stays at the capture rate. Depth is only a browser preview on the DGX;
+        # full-rate paired depth is recorded locally on the Jetson.
+        self.preview_depth_every = max(1, round(sensors.fps / getattr(args, "preview_depth_hz", 10.0)))
+        # An explicit lower preview rate remains available for constrained links.
         self.reduced_every = max(1, round(sensors.fps / args.preview_hz_recording))
+        self.writer_backoff_every = max(1, round(sensors.fps / 10.0))
+        self.writer_backoff = False
         # Keep raw capture references in a small latest-value queue. Submitting compression jobs
         # here would move the backlog into ThreadPoolExecutor's unbounded work queue, where old
         # frames could no longer be cancelled and live latency would grow by hundreds of ms.
@@ -241,11 +250,22 @@ class Edge:
         self.control_ws = None
         self.link = {"timeout_s": LINK_TIMEOUT_S, "gaps": 0, "max_gap_s": 0.0, "last_gap": None}
 
-    def snapshot(self, cycle=None):
+    def snapshot(self, cycle=None, include_depth=True, preview_scale=1.0):
         frames = []
         for camera in self.cameras:
             frame = camera.latest_frame(paired=camera.depth_enabled)
             if frame is not None:
+                if preview_scale != 1.0 or not include_depth:
+                    rgb = frame.rgb
+                    if preview_scale != 1.0:
+                        h, w = rgb.shape[:2]
+                        rgb = cv2.resize(rgb, (max(1, round(w * preview_scale)),
+                                               max(1, round(h * preview_scale))),
+                                         interpolation=cv2.INTER_AREA)
+                    frame = CameraFrame(rgb, frame.depth if include_depth else None,
+                                        frame.t_recv_ns, frame.seq, frame.frame_number,
+                                        frame.depth_dt_ms if include_depth else None,
+                                        frame.depth_units if include_depth else None)
                 info = dict(camera.info)
                 with self.hub.lock:
                     capture = self.hub.messages.get("cam:"+camera.name)
@@ -259,10 +279,10 @@ class Edge:
             meta["cycle"] = {k: getattr(cycle, k) for k in cycle.__slots__}
         return meta, frames
 
-    def enqueue(self, cycle=None):
+    def enqueue(self, cycle=None, include_depth=True, preview_scale=1.0):
         if not self.connected:
             return
-        meta, frames = self.snapshot(cycle)
+        meta, frames = self.snapshot(cycle, include_depth, preview_scale)
         self.sequence += 1
         meta["sequence"] = self.sequence
         meta["queued_monotonic_ns"] = time.monotonic_ns()
@@ -274,18 +294,29 @@ class Edge:
                 pass
         self.pending.put_nowait((meta, frames))
 
-    def reduced(self):
-        return self.recorder.state != "idle" or self.uploading
+    def preview_stride(self):
+        if self.recorder.state == "recording":
+            rec = self.recorder.current
+            backlog = max((w.queue.qsize() for w in rec.writers.values()), default=0) if rec else 0
+            if not self.writer_backoff and backlog >= 16:
+                self.writer_backoff = True
+                log.warning("recording preview reduced to 10 Hz: camera writer backlog %d", backlog)
+            elif self.writer_backoff and backlog <= 4:
+                self.writer_backoff = False
+                log.info("recording preview restored: camera writer backlog %d", backlog)
+            return self.writer_backoff_every if self.writer_backoff else self.reduced_every
+        self.writer_backoff = False
+        return self.writer_backoff_every if self.uploading else 1
 
     def stream_cycle(self, cycle=None):
         self.stream_tick += 1
-        if not self.reduced() or self.stream_tick % self.reduced_every == 0:
-            self.enqueue(cycle)
+        if self.stream_tick % self.preview_stride() == 0:
+            self.enqueue(cycle, include_depth=self.stream_tick % self.preview_depth_every == 0,
+                         preview_scale=0.5 if self.recorder.state == "recording" else 1.0)
 
     def on_cycle(self, cycle):
         self.cycle_count += 1
         self.recorder.on_cycle(cycle, self.cycle_count)
-        self.stream_cycle(cycle)
 
     def idle_capture(self):
         period = 1/self.sensor_args.fps
@@ -295,7 +326,7 @@ class Edge:
             if self.arms.state != "running":
                 self.cycle_count += 1  # cycle numbers keep counting, so a control pause is a visible gap
                 self.recorder.note_idle()
-                self.stream_cycle()
+            self.stream_cycle()
 
     def link_lost(self):
         if self.connected:
@@ -329,7 +360,7 @@ class Edge:
                 self.last_control = now
                 if data.get("type") == "ping":
                     await ws.send_json(dict(type="pong", t0=data["t0"], edge_ns=time.time_ns(),
-                                            sources=[s.status() for s in self.sources], base=self.base.status(),
+                                            sources=[s.status() for s in self.sources], base=dict(self.base.status(), driver_restart=True),
                                             dropped=self.dropped, recorder=self.recorder.status(), link=self.link))
                     continue
                 if data.get("type") != "command":
@@ -366,14 +397,45 @@ class Edge:
                         self.base.disable("arm control stopped")
                         self.arms.stop_control()
                         self.recorder.note_event("arm control stopped")
+                    elif action == "policy_start":
+                        if self.recorder.state == "recording":
+                            raise RuntimeError("stop recording before changing control mode")
+                        if len(self.cameras) != 3 or any(c.state != "running" or c.latest_frame() is None or
+                                time.time_ns()-c.latest_frame().t_recv_ns > 300_000_000 for c in self.cameras):
+                            raise RuntimeError("three fresh RGB cameras required")
+                        self.base.disable("policy controls arms only")
+                        self.arms.start_policy(data["owner"], settings=data.get("settings"))
+                        reply["policy"] = self.arms.policy.status()
+                    elif action == "policy_target":
+                        # A healthy control link does not excuse stale camera inputs.
+                        if any(c.state != "running" or c.latest_frame() is None or
+                               time.time_ns()-c.latest_frame().t_recv_ns > 300_000_000 for c in self.cameras):
+                            self.arms.policy.hold("stale camera input", data["owner"])
+                            raise RuntimeError("stale camera input")
+                        self.arms.policy.accept(data["owner"], data["sequence"], data["positions"])
+                        reply["policy"] = self.arms.policy.status()
+                    elif action == "policy_stop":
+                        self.arms.policy.hold("policy stopped", data.get("owner"))
+                        if self.arms.policy.mode != "teleop":
+                            self.base.disable("policy stopped")
+                        reply["policy"] = self.arms.policy.status()
+                    elif action == "arms_return":
+                        reply["policy"] = self.arms.return_to_teleop()
+                        self.recorder.note_event("arms returning to the staged pose")
                     elif action == "base_enable":
+                        if self.arms.policy.mode != "teleop":
+                            raise RuntimeError("base is disabled in policy/hold mode")
                         self.base.enable()
                     elif action == "base_disable":
                         self.base.disable("user")
                     elif action == "base_cmd":
+                        if self.arms.policy.mode != "teleop":
+                            raise RuntimeError("base is disabled in policy/hold mode")
                         error = self.base.command(data["owner"], data.get("vx"), data.get("wz"))
                         if error:
                             raise RuntimeError(error)
+                    elif action == "slate_restart":
+                        reply["slate"] = await self.restart_slate()
                     elif action == "base_release":
                         self.base.release(data["owner"])
                     elif action == "record_start":
@@ -387,6 +449,8 @@ class Edge:
                         raise ValueError("unknown action")
                     await ws.send_json(dict(type="result", id=data["id"], ok=True, **reply))
                 except Exception as exc:
+                    if action == "policy_target":
+                        self.arms.policy.hold("policy target rejected", data.get("owner"))
                     if action in ("control_start", "control_stop"):
                         self.control_grace_until = 0.0
                         self.control_transition_started = 0.0
@@ -499,6 +563,21 @@ class Edge:
         finally:
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
+
+    async def restart_slate(self):
+        """Web button: restart the SLATE base driver service (e.g. stuck after the base was power-cycled).
+        Returns at once; odometry comes back when the new driver has found the base."""
+        self.recorder.note_event("SLATE driver restart requested")
+        if self.fake_base:
+            return "simulated"
+        unit = getattr(self.args, "slate_unit", "teleop-jetson-slate.service")
+        proc = await asyncio.create_subprocess_exec("systemctl", "--user", "restart", "--no-block", unit,
+                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, err = await asyncio.wait_for(proc.communicate(), 5)
+        if proc.returncode:
+            raise RuntimeError(f"SLATE 드라이버 재시작 실패: {err.decode(errors='replace').strip()}")
+        log.warning("SLATE driver restart requested from the web UI (%s)", unit)
+        return "restarting"
 
     def transport_limit(self):
         """Seconds a data-link wait may take: generous only during a deliberate arm transition."""
@@ -638,8 +717,12 @@ def main():
                         help="Sessions are recorded here, then moved to the DGX")
     parser.add_argument("--rgb-crf", type=int, default=18, help="H.264 quality of the recorded RGB mp4")
     parser.add_argument("--rgb-preset", default="superfast", help="x264 preset (Jetson CPU vs size)")
-    parser.add_argument("--preview-hz-recording", type=float, default=10.0,
+    parser.add_argument("--preview-hz-recording", type=float, default=30.0,
                         help="Live view rate while recording/uploading")
+    parser.add_argument("--preview-depth-hz", type=float, default=10.0,
+                        help="Depth frames sent to the DGX for browser preview (RGB remains at full rate)")
+    parser.add_argument("--slate-unit", default="teleop-jetson-slate.service",
+                        help="systemd user unit of the SLATE driver (web button restarts it)")
     parser.add_argument("--camera-sampling", choices=["buffered", "latest"], default="buffered",
                         help="Recording: oldest unrecorded frame (absorbs arm-loop jitter) or newest frame")
     parser.add_argument("--upload-mbps", type=float, default=200.0, help="Session upload rate limit (Mbit/s)")

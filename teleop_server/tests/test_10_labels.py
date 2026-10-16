@@ -91,24 +91,25 @@ class LabelBrowserTest(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         shutil.rmtree(self.out, ignore_errors=True)
 
-    async def test_label_popup_from_button(self):
-        """No label panel on the page; the pop-up (also reachable from "라벨 입력") edits any session."""
+    async def test_label_popup_from_dataset_list(self):
+        """No label panel or label button on the page; the pop-up opens from the dataset list ("라벨 수정")."""
         async with AppHarness(*factories(self.out)) as h:
             await h.wait_for(lambda s: all(x["state"] == "running" for x in s["sources"] if x["kind"] == "camera"), 5)
             async with Chrome(1440, 1500) as c:
                 await c.open(str(h.client.make_url("/")))
                 await wait_page(c, "document.querySelector('#conn').dataset.state === 'open'")
                 self.assertIsNone(await c.eval("document.querySelector('#label-card')"))
-                self.assertTrue(await c.eval("document.querySelector('#btn-labels').hidden"), "no sessions yet")
+                self.assertIsNone(await c.eval("document.querySelector('#btn-labels')"), "replaced by the dataset list")
                 result = await record_once(self, h)
                 session = result["session"]
-                self.assertTrue(await wait_page(c, "!document.querySelector('#btn-labels').hidden"))
-                self.assertEqual(await c.eval(TEXT.format(sel="#btn-labels")), "라벨 입력")
-                self.assertIn("라벨 미입력", await c.eval(TEXT.format(sel="#rec-last")))
+                self.assertTrue(await wait_page(c, TEXT.format(sel="#rec-last") + ".includes('라벨 미입력')"))
                 self.assertFalse(await c.eval("document.querySelector('#label-dialog').open"),
                                  "a recording stopped elsewhere does not pop up here")
 
-                await c.eval("document.querySelector('#btn-labels').click()")
+                await c.eval("document.querySelector('#btn-datasets').click()")
+                self.assertTrue(await wait_page(c, f"!!document.querySelector('#ds-rows tr[data-session=\"{session}\"]')"))
+                await c.eval(f"[...document.querySelectorAll('#ds-rows tr[data-session=\"{session}\"] button')]"
+                             ".find(b => b.textContent === '라벨 수정').click()")
                 self.assertTrue(await wait_page(c, "document.querySelector('#label-dialog').open"))
                 self.assertFalse(await c.eval("document.querySelector('#ld-pick').hidden"))
                 self.assertEqual(await c.eval("document.querySelector('#ld-session').value"), session)
@@ -125,10 +126,12 @@ class LabelBrowserTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await wait_page(c, "!document.querySelector('#label-dialog').open"),
                                 await c.eval(TEXT.format(sel="#ld-msg")))
                 self.assertTrue(await wait_page(c, TEXT.format(sel="#rec-last") + ".includes('라벨 저장됨')"))
-                self.assertEqual(await c.eval(TEXT.format(sel="#btn-labels")), "라벨 보기·수정")
+                self.assertTrue(await wait_page(c, f"document.querySelector('#ds-rows tr[data-session=\"{session}\"]')"
+                                                   ".textContent.includes('실패')"), "the list shows the new label")
 
                 # Reopen: the saved labels are shown and can be revised.
-                await c.eval("document.querySelector('#btn-labels').click()")
+                await c.eval(f"[...document.querySelectorAll('#ds-rows tr[data-session=\"{session}\"] button')]"
+                             ".find(b => b.textContent === '라벨 수정').click()")
                 self.assertTrue(await wait_page(c, "document.querySelector('#label-dialog').open"))
                 self.assertTrue(await c.eval("document.querySelector('input[name=ld-outcome][value=failure]').checked"))
                 self.assertEqual(await c.eval("document.querySelector('#ld-env').value"), "실험실 책상 A")

@@ -8,11 +8,23 @@
 </head>
 <body>
 <header class="topbar">
-  <h1>Teleop Monitor</h1>
+  <div class="brand"><h1>Teleop Monitor</h1>
+    <button id="btn-datasets" class="btn small" type="button" aria-haspopup="dialog">데이터셋 목록</button>
+    <span id="tx-badge" class="metric" hidden></span></div>
   <div class="conn">
     <span id="conn" class="pill" data-state="connecting">연결 중</span>
     <span class="metric"><span class="k">RTT</span> <span id="rtt">–</span></span>
     <span class="metric"><span class="k">시계 오프셋</span> <span id="offset">–</span></span>
+  </div>
+  <div id="ai-banner" class="ai-banner" role="status" aria-live="polite" hidden>
+    <span class="ai-pulse" aria-hidden="true"></span>
+    <strong id="ai-banner-title"></strong>
+    <span id="ai-banner-text"></span>
+    <a id="ai-banner-log" class="ai-banner-link" download hidden>로그 받기</a>
+    <button id="ai-banner-resume" class="btn small" type="button" hidden>AI 재개</button>
+    <button id="ai-banner-return" class="btn small" type="button" hidden>원격조작 전환</button>
+    <button id="ai-banner-ok" class="btn small" type="button" hidden>확인</button>
+    <button id="ai-banner-stop" class="btn small" type="button">AI 정지</button>
   </div>
 </header>
 
@@ -24,6 +36,14 @@
         <span class="ctl-label">로봇 제어</span>
         <span id="arm-state" class="status" data-s="off"><i>–</i><span>정지</span></span>
         <button id="btn-control" class="btn primary" type="button" disabled>제어 시작</button>
+        <button id="btn-return" class="btn" type="button" hidden>원격조작 전환</button>
+      </div>
+      <div class="ctl-group ctl-ai" id="ai-group" hidden>
+        <span class="ctl-label">AI 제어</span>
+        <span id="ai-state" class="status" data-s="off"><i>–</i><span>꺼짐</span></span>
+        <button id="btn-ai" class="btn" type="button" aria-haspopup="dialog">AI 제어…</button>
+        <button id="btn-ai-resume" class="btn" type="button" hidden>AI 재개</button>
+        <button id="btn-ai-stop" class="btn danger" type="button" hidden>AI 정지</button>
       </div>
       <div class="ctl-group ctl-rec">
         <span class="ctl-label">녹화</span>
@@ -33,8 +53,8 @@
       </div>
     </div>
     <div id="ctl-msg" class="ctl-msg" role="alert" hidden></div>
-    <div class="rec-last"><span id="rec-last"></span>
-      <button id="btn-labels" class="mini" type="button" hidden>라벨 입력</button></div>
+    <div id="rec-warn" class="ctl-msg" role="alert" hidden></div>
+    <div class="rec-last"><span id="rec-last"></span></div>
   </section>
 
   <section aria-labelledby="h-cams">
@@ -63,7 +83,15 @@
   </section>
 
   <section aria-labelledby="h-base">
-    <h2 id="h-base">모바일 베이스 <span class="sub">odometry · 궤적 · 가상 컨트롤러는 떠 있는 창</span></h2>
+    <div class="sec-head">
+      <h2 id="h-base">모바일 베이스 <span class="sub">odometry · 궤적 · 가상 컨트롤러는 떠 있는 창</span></h2>
+      <div class="cam-tools">
+        <span id="odom-state" class="status" data-s="off"><i>–</i><span>odometry –</span></span>
+        <button class="mini" id="btn-slate" type="button" hidden
+          title="SLATE 전원을 껐다 켰는데 odometry가 안 들어올 때">SLATE 드라이버 재시작</button>
+        <span id="slate-msg" class="lb-msg" role="status"></span>
+      </div>
+    </div>
     <div class="base card">
       <dl class="kv" id="odom-kv"></dl>
       <div class="traj-wrap"><canvas id="traj" aria-label="베이스 궤적 (위에서 본 x-y)"></canvas><div class="traj-note" id="traj-note">최근 60초 궤적 · 격자 1 m</div></div>
@@ -109,6 +137,8 @@
     <label class="speed">투명도 <input id="joy-alpha" type="range" min="0" max="80" step="5" value="15">
       <span id="joy-alpha-val">15%</span></label>
     <div class="joy-read" id="joy-read">–</div>
+    <div class="joy-odom" id="joy-odom" role="alert" hidden>⚠ 베이스 odometry 없음
+      <button class="mini" id="btn-slate-float" type="button">SLATE 드라이버 재시작</button></div>
     <p class="joy-help">로봇 제어 중, 누르는 동안만 움직입니다. 키보드 W·S·A·D 또는 방향키.</p>
   </div>
 </aside>
@@ -138,6 +168,173 @@
   </form>
 </dialog>
 <div id="tooltip" class="tooltip" role="status" hidden></div>
+<dialog id="ds-dialog" class="dialog ds-dialog" aria-labelledby="ds-title">
+  <div class="ds-head">
+    <button id="ds-back" class="btn small" type="button" hidden>← 목록</button>
+    <h2 id="ds-title">데이터셋</h2>
+    <span id="ds-sub" class="metric"></span>
+    <button id="ds-close" class="btn small ds-close" type="button">닫기</button>
+  </div>
+  <div id="ds-list-view" class="ds-body">
+    <div class="ds-tools" role="search">
+      <input id="ds-search" type="search" placeholder="세션, 작업명, 작업자, 환경, 설명 검색" aria-label="검색">
+      <select id="ds-filter" aria-label="보기">
+        <option value="all">전체</option><option value="success">결과: 성공</option>
+        <option value="failure">결과: 실패</option><option value="unlabeled">라벨 미입력</option>
+        <option value="failed">녹화 실패</option>
+      </select>
+      <span id="ds-count" class="metric"></span>
+    </div>
+    <div class="ds-tools ds-send-bar">
+      <span id="ds-selected" class="metric">선택 0개</span>
+      <button id="ds-send" class="btn small primary" type="button" disabled>보내기…</button>
+      <button id="ds-send-quick" class="btn small" type="button" disabled hidden></button>
+      <span id="tx-inline" class="metric"></span>
+    </div>
+    <div class="ds-table-wrap">
+      <table class="ds-table">
+        <thead><tr><th scope="col" class="sel"><input type="checkbox" id="ds-all" aria-label="보이는 세션 모두 선택"></th>
+          <th scope="col">세션 (녹화 시작)</th><th scope="col" class="num">길이</th><th scope="col" class="num">프레임</th>
+          <th scope="col">녹화</th><th scope="col">결과</th><th scope="col">작업명</th><th scope="col">작업자</th>
+          <th scope="col">환경</th><th scope="col"><span class="sr-only">동작</span></th></tr></thead>
+        <tbody id="ds-rows"></tbody>
+      </table>
+      <p id="ds-empty" class="ds-empty" hidden>표시할 세션이 없습니다.</p>
+    </div>
+  </div>
+  <div id="ds-detail-view" class="ds-body" hidden>
+    <div class="ds-detail-head">
+      <span id="dd-status" class="status"><i></i><span></span></span>
+      <span id="dd-outcome" class="status"><i></i><span></span></span>
+      <span id="dd-valid" class="status"><i></i><span></span></span>
+      <span class="ds-spacer"></span>
+      <button id="dd-edit" class="btn small" type="button">라벨 수정</button>
+      <button id="dd-delete" class="btn small danger" type="button">삭제</button>
+    </div>
+    <p id="dd-error" class="ctl-msg" role="alert" hidden></p>
+    <div class="ds-grid">
+      <section class="ds-card" aria-labelledby="dd-h-info"><h3 id="dd-h-info">녹화 정보</h3><dl class="kv" id="dd-info"></dl></section>
+      <section class="ds-card" aria-labelledby="dd-h-labels"><h3 id="dd-h-labels">라벨</h3><dl class="kv" id="dd-labels"></dl></section>
+    </div>
+    <section class="ds-card" id="dd-media" aria-labelledby="dd-h-media">
+      <div class="ds-card-head"><h3 id="dd-h-media">카메라</h3>
+        <label class="ds-check"><input type="checkbox" id="dd-depth-on" checked> depth 함께 보기</label></div>
+      <div class="ds-videos" id="dd-videos"></div>
+      <div class="ds-player">
+        <button id="dd-play" class="btn small primary" type="button" aria-label="재생">재생</button>
+        <input id="dd-seek" type="range" min="0" max="0" step="1" value="0" aria-label="프레임 위치">
+        <span id="dd-time" class="metric"></span>
+      </div>
+      <p class="ds-note" id="dd-media-note"></p>
+    </section>
+    <section class="ds-card" id="dd-plots" aria-labelledby="dd-h-plots">
+      <h3 id="dd-h-plots">로봇 상태 <span class="sub">팔로워 위치 · 세로선 = 현재 프레임 · 차트를 누르면 그 시점으로 이동</span></h3>
+      <div class="ds-charts">
+        <figure class="ds-chart"><figcaption>왼팔 관절 (rad)</figcaption><canvas id="dd-c-left"></canvas><div class="ds-legend" id="dd-l-left"></div></figure>
+        <figure class="ds-chart"><figcaption>오른팔 관절 (rad)</figcaption><canvas id="dd-c-right"></canvas><div class="ds-legend" id="dd-l-right"></div></figure>
+        <figure class="ds-chart"><figcaption>그리퍼 (mm)</figcaption><canvas id="dd-c-grip"></canvas><div class="ds-legend" id="dd-l-grip"></div></figure>
+        <figure class="ds-chart"><figcaption>베이스 궤적 (위에서 본 x-y, m)</figcaption><canvas id="dd-c-base"></canvas>
+          <div class="ds-legend" id="dd-l-base"></div></figure>
+      </div>
+      <details class="ds-values"><summary>현재 프레임 값 (표)</summary><div id="dd-values"></div></details>
+    </section>
+    <section class="ds-card" aria-labelledby="dd-h-files"><h3 id="dd-h-files">저장된 데이터</h3><dl class="kv" id="dd-files"></dl></section>
+  </div>
+  <div id="ds-tip" class="tooltip" role="status" hidden></div>
+</dialog>
+<dialog id="tx-dialog" class="dialog tx-dialog" aria-labelledby="tx-title">
+  <form id="tx-form" class="tx-form" method="dialog" autocomplete="off">
+    <div class="dialog-head"><h2 id="tx-title">데이터셋 보내기 (SSH)</h2><span id="tx-summary" class="metric"></span></div>
+    <div id="tx-setup">
+      <fieldset class="tx-target"><legend>받는 컴퓨터</legend>
+        <label class="f">저장된 대상 <select id="tx-preset"></select></label>
+        <div class="tx-grid">
+          <label class="f">이름 <input id="tx-name" type="text" maxlength="60" placeholder="예: bai-vscode"></label>
+          <label class="f">호스트 <input id="tx-host" type="text" maxlength="253" placeholder="예: proxy1.example.com"></label>
+          <label class="f">포트 <input id="tx-port" type="number" min="1" max="65535" value="22"></label>
+          <label class="f">사용자 <input id="tx-user" type="text" maxlength="32"></label>
+          <div class="f wide"><label for="tx-dir">받을 폴더 (데이터셋이 저장될 경로 · 상대 경로는 받는 쪽 홈 기준)</label>
+            <div class="tx-dirline"><input id="tx-dir" type="text" maxlength="300" value="teleop_datasets">
+              <button id="tx-browse" class="btn small" type="button">찾아보기…</button></div></div>
+        </div>
+        <div id="tx-browser" class="tx-browser" hidden>
+          <div class="tx-bhead">
+            <button id="txb-up" class="btn small" type="button" title="상위 폴더">↑ 위로</button>
+            <button id="txb-home" class="btn small" type="button">홈</button>
+            <input id="txb-path" type="text" aria-label="받는 쪽 경로" spellcheck="false">
+            <button id="txb-go" class="btn small" type="button">이동</button>
+          </div>
+          <p id="txb-info" class="tx-hint" role="status"></p>
+          <ul id="txb-list" class="txb-list" aria-label="폴더"></ul>
+          <div class="tx-bfoot">
+            <input id="txb-new" type="text" maxlength="100" placeholder="새 폴더 이름" aria-label="새 폴더 이름">
+            <button id="txb-mkdir" class="btn small" type="button">새 폴더 만들기</button>
+            <span class="ds-spacer"></span>
+            <button id="txb-pick" class="btn small primary" type="button">이 폴더에 저장</button>
+            <button id="txb-close" class="btn small" type="button">닫기</button>
+          </div>
+        </div>
+        <label class="ds-check"><input type="checkbox" id="tx-checkkey"> 호스트 키 확인 (끄면 ssh 설정의 StrictHostKeyChecking no와 같음)</label>
+        <details class="tx-paste"><summary>SSH 설정 붙여넣기</summary>
+          <textarea id="tx-config" rows="6" placeholder="Host bai-vscode&#10; User work&#10; Hostname proxy1.example.com&#10; Port 10773"></textarea>
+          <button id="tx-parse" class="btn small" type="button">이 설정으로 채우기</button></details>
+        <div class="actions"><button id="tx-save" class="btn small" type="button">대상 저장</button>
+          <button id="tx-delete" class="btn small" type="button">대상 삭제</button>
+          <span class="tx-hint">저장되는 것은 주소·포트·사용자·폴더뿐이고, 비밀번호는 저장하지 않습니다.</span></div>
+      </fieldset>
+      <label class="f">비밀번호 <input id="tx-password" type="password" autocomplete="new-password"
+        placeholder="이번 전송에만 쓰고 저장하지 않습니다"></label>
+      <label class="f">업로드 속도 제한 (Mbit/s, 0 = 제한 없음) <input id="tx-rate" type="number" min="0" max="10000" value="100"></label>
+      <p class="tx-hint">DGX의 Wi-Fi는 Jetson 연결과 같이 쓰므로, 로봇을 조작하는 동안에는 제한을 두는 것이 안전합니다.
+        받는 쪽에 이미 같은 세션이 있으면 건너뛰고, 아무것도 덮어쓰거나 지우지 않습니다.</p>
+      <p id="tx-check" class="tx-check" role="status"></p>
+    </div>
+    <div id="tx-progress" hidden>
+      <p id="tx-where" class="tx-hint"></p>
+      <progress id="tx-bar" max="1" value="0"></progress>
+      <p id="tx-numbers" class="metric"></p>
+      <ol id="tx-list" class="tx-list"></ol>
+    </div>
+    <p id="tx-msg" class="lb-msg" role="alert"></p>
+    <div class="actions">
+      <button id="tx-test" class="btn" type="button">연결 확인</button>
+      <button id="tx-start" class="btn primary" type="submit" value="start">보내기 시작</button>
+      <button id="tx-cancel" class="btn danger" type="button" hidden>전송 취소</button>
+      <button id="tx-close" class="btn" type="button">닫기</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="ai-dialog" class="dialog ai-dialog" aria-labelledby="ai-title">
+  <div class="dialog-head"><h2 id="ai-title">AI 제어</h2><span id="ai-root" class="metric"></span></div>
+  <div id="ai-models" class="ai-models" role="radiogroup" aria-label="추론 모델"></div>
+  <fieldset class="ai-run"><legend>실행</legend>
+    <label class="f">작업 문장 (task) <input id="ai-task" type="text" maxlength="500"></label>
+    <div class="ai-runrow">
+      <label class="f">실행 시간 (초, 최대 300) <input id="ai-seconds" type="number" min="1" max="300" step="1" value="30"></label>
+      <label class="ds-check"><input type="checkbox" id="ai-execute" checked> 실제로 팔 움직이기 (끄면 예측만, 팔은 그대로)</label>
+    </div>
+    <label class="ds-check"><input type="checkbox" id="ai-return"> 끝나면 바로 원격조작으로 전환 (끄면 자세 유지 후 AI 재개·원격조작 전환 선택)</label>
+  </fieldset>
+  <p id="ai-msg" class="lb-msg" role="alert"></p>
+  <details id="ai-runs-box" class="ai-runs-box"><summary>실행 기록 (최근 100개)</summary>
+    <label class="ds-check ai-pick-all"><input type="checkbox" id="ai-runs-all"> 전체 선택</label>
+    <ul id="ai-runs" class="ai-runs"></ul></details>
+  <details id="ai-errors-box" class="ai-runs-box"><summary>오류 기록<span id="ai-errors-count"></span></summary>
+    <label class="ds-check ai-pick-all"><input type="checkbox" id="ai-errors-all"> 전체 선택</label>
+    <ul id="ai-errors" class="ai-runs"></ul></details>
+  <div id="ai-pick-bar" class="ai-pick-bar">
+    <span id="ai-pick-count" class="metric">로그를 체크해서 고르면 한 번에 받을 수 있습니다.</span>
+    <button id="ai-pick-clear" class="btn small" type="button" hidden>선택 해제</button>
+    <button id="ai-pick-download" class="btn small primary" type="button" disabled>선택한 로그 받기 (.zip)</button>
+  </div>
+  <div class="actions">
+    <button id="ai-start" class="btn primary" type="button">AI 제어 시작</button>
+    <button id="ai-stop" class="btn danger" type="button" hidden>AI 정지</button>
+    <button id="ai-close" class="btn" type="button">닫기</button>
+  </div>
+</dialog>
 <script src="/static/app.js"></script>
+<script src="/static/ai.js"></script>
+<script src="/static/datasets.js"></script>
 </body>
 </html>

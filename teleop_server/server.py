@@ -189,6 +189,171 @@ async def api_label(request):
     return web.json_response({"ok": True, "labels": labels})
 
 
+def _datasets_dir(request):
+    from teleop_server.labels import LabelError
+    rec = request.app[RECORDER]
+    if rec is None:
+        raise LabelError("녹화를 사용할 수 없습니다.")
+    return rec.output_dir
+
+
+def _run(fn, *args):
+    return asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
+
+def _dataset_handler(fn):
+    """Dataset browser handlers: LabelError (bad name, missing session/file) -> JSON error."""
+    async def handler(request):
+        from teleop_server.labels import LabelError
+        try:
+            return await fn(request)
+        except LabelError as exc:
+            return _error(exc.status, str(exc))
+    return handler
+
+
+@_dataset_handler
+async def api_datasets(request):
+    """Dataset browser: every recorded session, newest first."""
+    from teleop_server.datasets import list_all
+    return web.json_response({"ok": True, "sessions": await _run(list_all, _datasets_dir(request))})
+
+
+@_dataset_handler
+async def api_dataset(request):
+    from teleop_server.datasets import detail
+    data = await _run(detail, _datasets_dir(request), request.match_info["session"])
+    return web.json_response({"ok": True, "session": data})
+
+
+@_dataset_handler
+async def api_dataset_delete(request):
+    """Move a session to <dataset>/.trash (recoverable). Never the one being recorded or saved."""
+    from teleop_server.datasets import trash
+    name, rec = request.match_info["session"], request.app[RECORDER]
+    current = getattr(rec, "session", None)
+    if current is not None and current.root.name == name:
+        return _error(409, "녹화·저장 중인 세션은 삭제할 수 없습니다.")
+    if name in request.app[TRANSFER].busy_sessions():
+        return _error(409, "보내는 중인 세션은 삭제할 수 없습니다.")
+    target = await _run(trash, _datasets_dir(request), name)
+    log.info("session %s moved to %s", name, target)
+    request.app[HUB].publish("labels", {"type": "labels", "session": name, "deleted": True})
+    return web.json_response({"ok": True, "trash": str(target)})
+
+
+@_dataset_handler
+async def api_dataset_video(request):
+    from teleop_server.datasets import video_path
+    path = await _run(video_path, _datasets_dir(request), request.match_info["session"],
+                      request.match_info["camera"])
+    return web.FileResponse(path, headers={"Content-Type": "video/mp4", "Cache-Control": "no-cache"})
+
+
+@_dataset_handler
+async def api_dataset_depth(request):
+    from teleop_server.datasets import depth_jpeg
+    try:
+        index = int(request.match_info["index"])
+    except ValueError:
+        return _error(400, "잘못된 프레임 번호입니다.")
+    jpg, info = await _run(depth_jpeg, _datasets_dir(request), request.match_info["session"],
+                           request.match_info["camera"], index)
+    return web.Response(body=jpg, content_type="image/jpeg",
+                        headers={"Cache-Control": "max-age=3600", "X-Depth-Valid": str(info["valid_fraction"]),
+                                 "X-Depth-Median-M": "" if info["median_m"] is None else str(info["median_m"])})
+
+
+TRANSFER = web.AppKey("transfer", object)
+PREVIEWS = web.AppKey("depth_previews", object)
+
+
+@_dataset_handler
+async def api_depth_preview(request):
+    """GET: status of the session's depth preview videos; POST: also start making missing ones."""
+    previews, name = request.app[PREVIEWS], request.match_info["session"]
+    fn = previews.ensure if request.method == "POST" else previews.status
+    return web.json_response({"ok": True, "cameras": await _run(fn, _datasets_dir(request), name)})
+
+
+@_dataset_handler
+async def api_depth_video(request):
+    path = await _run(request.app[PREVIEWS].video, _datasets_dir(request), request.match_info["session"],
+                      request.match_info["camera"])
+    return web.FileResponse(path, headers={"Content-Type": "video/mp4", "Cache-Control": "no-cache"})
+
+
+def _transfer_error(fn):
+    async def handler(request):
+        from teleop_server.labels import LabelError
+        from teleop_server.transfer import TransferError
+        try:
+            return await fn(request)
+        except (TransferError, LabelError) as exc:
+            return _error(exc.status, str(exc))
+    return handler
+
+
+@_transfer_error
+async def api_transfer(request):
+    """Current/last transfer and the saved targets (never a password)."""
+    from teleop_server.transfer import load_targets
+    return web.json_response({"ok": True, "transfer": request.app[TRANSFER].status(), "targets": load_targets()})
+
+
+@_transfer_error
+async def api_transfer_post(request):
+    """Actions: browse | mkdir | close_browse | test | start | cancel | save_target | delete_target | parse_config."""
+    from teleop_server import transfer as tx
+    body, mgr = await _body(request), request.app[TRANSFER]
+    action = body.get("action")
+    if action == "parse_config":
+        return web.json_response({"ok": True, "target": tx.parse_ssh_config(body.get("text"))})
+    if action == "save_target":
+        return web.json_response({"ok": True, "target": tx.save_target(body.get("target")), "targets": tx.load_targets()})
+    if action == "delete_target":
+        tx.delete_target(str(body.get("name") or ""))
+        return web.json_response({"ok": True, "targets": tx.load_targets()})
+    if action == "cancel":
+        return web.json_response({"ok": True, "cancelled": mgr.cancel()})
+    if action == "close_browse":
+        return web.json_response({"ok": True, "closed": await _run(mgr.close_browser, body.get("token"))})
+    if action == "browse":
+        listing = await _run(mgr.browse, body.get("target"), body.get("password"), body.get("token"), body.get("path"))
+        return web.json_response({"ok": True, "listing": listing})
+    if action == "mkdir":
+        listing = await _run(mgr.mkdir, body.get("target"), body.get("password"), body.get("token"), body.get("path"),
+                             body.get("name"))
+        return web.json_response({"ok": True, "listing": listing})
+    record_dir = _datasets_dir(request)
+    if action == "test":
+        info = await _run(mgr.test, record_dir, body.get("target"), body.get("password"), body.get("sessions") or [],
+                          body.get("token"))
+        return web.json_response({"ok": True, "check": info})
+    if action == "start":
+        status = await _run(mgr.start, record_dir, body.get("target"), body.get("password"), body.get("sessions"),
+                            body.get("rate_mbps", 100), body.get("token"))
+        return web.json_response({"ok": True, "transfer": status})
+    return _error(400, "알 수 없는 동작입니다.")
+
+
+def add_dataset_routes(app):
+    from teleop_server.datasets import DepthPreviews
+    from teleop_server.transfer import Transfer
+    app[TRANSFER] = Transfer(publish=lambda status: app[HUB].publish("transfer", status))
+    app[PREVIEWS] = DepthPreviews()
+    app.router.add_get("/api/datasets/{session}/depth_preview", api_depth_preview)
+    app.router.add_post("/api/datasets/{session}/depth_preview", api_depth_preview)
+    app.router.add_get("/api/datasets/{session}/depth_video/{camera}", api_depth_video)
+    app.router.add_get("/api/transfer", api_transfer)
+    app.router.add_post("/api/transfer", api_transfer_post)
+    app.router.add_get("/api/datasets", api_datasets)
+    app.router.add_get("/api/datasets/{session}", api_dataset)
+    app.router.add_delete("/api/datasets/{session}", api_dataset_delete)
+    app.router.add_get("/api/datasets/{session}/video/{camera}", api_dataset_video)
+    app.router.add_get("/api/datasets/{session}/depth/{camera}/{index}", api_dataset_depth)
+
+
 async def api_base(request):
     """Enable/disable the virtual base controller. Enabled + a held joystick MOVES the base."""
     base, action = request.app[BASE], (await _body(request)).get("action")
@@ -333,6 +498,7 @@ def create_app(sources_factory, recorder_factory=None, base_factory=None):
     app.router.add_post("/api/record", api_record)
     app.router.add_get("/api/sessions", api_sessions)
     app.router.add_post("/api/label", api_label)
+    add_dataset_routes(app)
     app.router.add_post("/api/base", api_base)
     app.router.add_static("/static", STATIC)
     return app

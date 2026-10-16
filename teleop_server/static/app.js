@@ -84,8 +84,8 @@ function buildArms() {
     const rows = JOINTS.map((j, i) => `<tr><td>${j}</td><td data-r="leader" data-i="${i}">–</td>
       <td data-r="follower" data-i="${i}">–</td><td class="delta" data-r="delta" data-i="${i}">–</td></tr>`).join("");
     el.innerHTML = `<h3>${label}<span data-k="rate">리더 – Hz · 팔로워 – Hz</span></h3>
-      <table class="joints"><thead><tr><th scope="col">관절</th><th scope="col">리더</th><th scope="col">팔로워</th>
-      <th scope="col" title="리더 − 팔로워">차이</th></tr></thead><tbody>${rows}</tbody></table>
+      <table class="joints"><thead><tr><th scope="col">관절</th><th scope="col" class="col-leader">리더</th><th scope="col">팔로워</th>
+      <th scope="col" class="col-delta" title="리더 − 팔로워">차이</th></tr></thead><tbody>${rows}</tbody></table>
       <div class="err" data-k="err"></div>`;
     root.appendChild(el);
     el.dataset.side = side;
@@ -159,7 +159,9 @@ function onText(m, tRecv) {
       renderSources(); return renderControl();
     case "status": sources[m.name] = m; renderSources(); return renderControl();
     case "record": recState = m; renderControl(); return onRecordState(m);
-    case "labels": return loadSessions();
+    case "labels": loadSessions(); return window.datasetsChanged?.(m);
+    case "transfer": return window.transferChanged?.(m);
+    case "ai": return window.aiChanged?.(m);
     case "base_ctl": baseState = m; return renderBase();
     case "base_reject": $("#joy-read").textContent = `거부됨: ${m.reason}`; return;
     case "stats":
@@ -250,6 +252,14 @@ function paintTelemetry() {
 
 // ---------- panels ----------
 function renderArms() {
+  // AI control drives the followers; the leaders stand still, so leader and difference say nothing.
+  const policyMode = sources.arms?.state === "running" ? sources.arms?.info?.policy?.mode : null;
+  const aiMode = policyMode === "policy" || policyMode === "hold" || policyMode === "returning";
+  if ($("#arms").classList.contains("ai-mode") !== aiMode) {
+    $("#arms").classList.toggle("ai-mode", aiMode);
+    $("#h-arms .sub").textContent = aiMode ? "AI 제어: 팔로워 위치만 (리더는 쓰지 않음) · rad, 그리퍼 mm"
+      : "리더 · 팔로워 위치 (rad, 그리퍼 mm)";
+  }
   for (const el of document.querySelectorAll(".arm")) {
     const side = el.dataset.side;
     const L = latest[`leader_${side}`]?.m, F = latest[`follower_${side}`]?.m;
@@ -259,7 +269,7 @@ function renderArms() {
       $(`[data-r="leader"][data-i="${i}"]`, el).textContent = lv == null ? "–" : fmt(lv * k, d);
       $(`[data-r="follower"][data-i="${i}"]`, el).textContent = fv == null ? "–" : fmt(fv * k, d);
       const cell = $(`[data-r="delta"][data-i="${i}"]`, el);
-      if (lv == null || fv == null) { cell.textContent = "–"; cell.classList.remove("big"); continue; }
+      if (aiMode || lv == null || fv == null) { cell.textContent = "–"; cell.classList.remove("big"); continue; }
       const delta = (lv - fv) * k;
       cell.textContent = fmt(delta, d);
       cell.classList.toggle("big", Math.abs(delta) > (grip ? 5 : 0.1));
@@ -370,10 +380,15 @@ function lastResultText(r) {
 
 function renderControl() {
   renderBase();  // the joystick follows robot control
-  renderLabelButton();
   const arms = sources.arms, st = arms?.state ?? "off";
   const btn = $("#btn-control");
-  setStatus($("#arm-state"), arms ? (ARM_UI[st] || ["off", "–", st]) : ["off", "–", "팔 소스 꺼짐"]);
+  // Followers driven by an AI model, or holding their pose after it stopped (not following the leaders).
+  const mode = st === "running" ? arms?.info?.policy?.mode : null;
+  setStatus($("#arm-state"), !arms ? ["off", "–", "팔 소스 꺼짐"] : mode === "policy" ? ["ai", "●", "AI가 제어 중"]
+    : mode === "hold" ? ["warning", "!", "자세 유지 (리더 추종 안 함)"]
+    : mode === "returning" ? ["warning", "…", "준비 자세로 돌아가는 중"] : (ARM_UI[st] || ["off", "–", st]));
+  $("#btn-return").hidden = mode !== "hold";
+  $("#btn-return").disabled = busy.control;
   const active = st === "running" || st === "starting";
   btn.disabled = !arms || busy.control || st === "starting" || st === "stopping";
   btn.textContent = st === "starting" ? "연결 중…" : st === "stopping" ? "정지 중…" : active ? "제어 중지" : "제어 시작";
@@ -381,6 +396,10 @@ function renderControl() {
 
   const rec = recState, rbtn = $("#btn-record");
   const rs = rec?.state ?? "idle";
+  // Recording but nothing stored (e.g. no base odometry): say so while it happens.
+  const stall = rs === "recording" ? rec?.stalled : null, warn = $("#rec-warn");
+  warn.hidden = !stall;
+  warn.textContent = stall ? `⚠ 지금 저장되지 않고 있습니다 (${fmt(stall.for_s, 0)}초째): ${stall.hint}` : "";
   if (!rec || !rec.available) {
     setStatus($("#rec-state"), ["off", "–", "사용 불가"]);
     rbtn.disabled = true;
@@ -413,6 +432,17 @@ function renderControl() {
   $("#rec-last").textContent = parts.join(" · ");
 }
 
+// After AI control the followers hold their pose: all four arms go back to the staged pose together
+// (a few seconds), then the followers follow the leaders again, as right after "제어 시작".
+async function returnToTeleop() {
+  if (!confirm("팔 4대(리더 포함)가 준비 자세로 함께 돌아간 뒤 팔로워가 다시 리더를 따라갑니다.\n" +
+    "주변에 사람, 물체, 케이블이 없는지 확인하세요.\n원격조작으로 전환할까요?")) return;
+  busy.control = true; showMsg(""); renderControl();
+  try { await post("/api/control", { action: "return" }); } catch (e) { showMsg(`원격조작 전환 실패: ${e.message}`); }
+  busy.control = false; renderControl();
+}
+window.returnToTeleop = returnToTeleop;
+
 async function post(url, body) {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const data = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
@@ -440,6 +470,7 @@ function bindControls() {
     } catch (e) { showMsg(`제어 ${start ? "시작" : "중지"} 실패: ${e.message}`); }
     busy.control = false; renderControl();
   });
+  $("#btn-return").addEventListener("click", returnToTeleop);
   $("#btn-record").addEventListener("click", async () => {
     const stop = recState?.state === "recording";
     const recording = stop ? recState : null;
@@ -730,7 +761,7 @@ function bindJoyFloat() {
 
 // ---------- labels ----------
 // Labels are entered only in the pop-up: it opens when this browser stops a recording, or from the
-// "라벨" button next to the last recording (with a list of recent sessions).
+// dataset list ("라벨 수정", datasets.js).
 let sessions = [];
 let lastSeenResult = null;
 const store = { get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
@@ -745,17 +776,13 @@ function sessionLabel(x) {
 async function loadSessions() {
   try {
     const r = await fetch("/api/sessions?limit=30");
-    sessions = (await r.json()).sessions || [];
+    const fresh = (await r.json()).sessions || [];
+    const shown = dialogMode === "edit" ? $("#ld-session").value : null;  // e.g. an old session opened from the dataset list
+    const keep = shown && !fresh.some((x) => x.session === shown) ? sessions.find((x) => x.session === shown) : null;
+    sessions = keep ? [...fresh, keep] : fresh;
   } catch { return; }
   if (dialogMode === "edit") fillSessionSelect($("#ld-session").value);
   renderControl();
-}
-
-function renderLabelButton() {
-  const btn = $("#btn-labels"), r = recState?.last_result;
-  const last = r && sessions.find((x) => x.session === r.session);
-  btn.hidden = sessions.length === 0;
-  btn.textContent = last && !last.labels ? "라벨 입력" : "라벨 보기·수정";
 }
 
 function onRecordState(m) {
@@ -874,7 +901,6 @@ function bindLabelDialog() {
     fillDialog(e.target.value);
   });
   $("#ld-session").addEventListener("focus", (e) => { e.target.dataset.shown = e.target.value; });
-  $("#btn-labels").addEventListener("click", () => openLabelEditor(recState?.last_result?.session));
   $("#ld-later").addEventListener("click", () => { dialogPending = null; $("#label-dialog").close(); });
   $("#label-dialog").addEventListener("close", () => { dialogPending = null; dialogMode = null; ldDirty = false; });
 }
@@ -930,6 +956,38 @@ function tick() {
 }
 setInterval(tick, 1000);
 
+// Base odometry arriving? The SLATE driver can be restarted from here (Jetson service).
+function renderOdomState() {
+  const st = S.odom, src = sources.odom, age = st.last ? (wallNow() - st.last) / 1000 : null;
+  const stale = !!src && (age == null || age * 1000 > STALE_MS);
+  setStatus($("#odom-state"), !src ? ["off", "–", "odometry 꺼짐"]
+    : stale ? ["critical", "!", age == null ? "odometry 수신 없음" : `odometry 수신 없음 (${fmt(age, 0)}초)`]
+    : ["good", "✓", `odometry ${fmt(st.arrivals.rate(), 0)} Hz`]);
+  const can = !!baseState?.driver_restart;
+  $("#btn-slate").hidden = !can;
+  $("#joy-odom").hidden = !(can && stale);
+}
+setInterval(renderOdomState, 1000);
+
+let slateBusy = false;
+async function restartSlate() {
+  if (slateBusy) return;
+  if (!confirm("SLATE 베이스 드라이버를 다시 시작합니다.\n몇 초 동안 odometry가 끊기고 베이스는 움직이지 않습니다.\n" +
+               "odometry 위치(x, y, yaw)가 0부터 다시 시작될 수 있습니다.\n" +
+               "녹화 중이면 그동안의 주기는 저장되지 않습니다(녹화는 계속됩니다). 가능하면 녹화 사이에 누르세요.\n계속할까요?")) return;
+  slateBusy = true;
+  for (const b of [$("#btn-slate"), $("#btn-slate-float")]) b.disabled = true;
+  const msg = $("#slate-msg");
+  msg.classList.remove("err");
+  msg.textContent = "재시작 중…";
+  try {
+    await post("/api/base", { action: "restart_driver" });
+    msg.textContent = "재시작했습니다. 몇 초 안에 odometry가 돌아와야 합니다. 안 돌아오면 SLATE 전원과 USB 케이블을 확인하세요.";
+  } catch (err) { msg.textContent = `재시작 실패: ${err.message}`; msg.classList.add("err"); }
+  slateBusy = false;
+  for (const b of [$("#btn-slate"), $("#btn-slate-float")]) b.disabled = false;
+}
+
 function drawSpark(name) {
   const st = S[name], c = $("canvas", st.row);
   const { ctx, w, h } = fitCanvas(c);
@@ -969,6 +1027,7 @@ function sparkHover(name, c, e) {
   tip.style.top = `${e.clientY - 34}px`;
 }
 
+for (const id of ["#btn-slate", "#btn-slate-float"]) $(id).addEventListener("click", restartSlate);
 buildCams(); buildArms(); buildOdom(); buildLatency(); bindControls(); bindLabelDialog(); bindBase(); bindJoyFloat(); bindLayout();
 renderControl(); renderBase(); loadSessions();
 connect();

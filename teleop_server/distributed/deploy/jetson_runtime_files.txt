@@ -2,6 +2,7 @@
 # Git checkout ~/ws/teleop_server. build_jetson_runtime.sh copies these to edge_runtime/.
 teleop_server/__init__.py
 teleop_server/base_control.py
+teleop_server/policy_control.py
 teleop_server/hub.py
 teleop_server/latency.py
 teleop_server/server.py

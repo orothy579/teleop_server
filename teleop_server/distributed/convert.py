@@ -18,7 +18,7 @@ from teleop_server.recorder import (DEFAULT_TASK, RAW_DEPTH_DIR, REPO_ID, ROBOT_
                                  collector_modules)
 from teleop_server.sources.arms import Cycle
 from teleop_server.sources.camera import CameraFrame
-from .local_recorder import DEPTH_CODECS, DEPTH_MAGIC, DEPTH_RECORD, MANIFEST
+from .local_recorder import DEPTH_CODECS, DEPTH_MAGIC, DEPTH_RECORD, MANIFEST, skip_hint
 from .protocol import decode_depth
 
 CODEC_NAMES = {v: k for k, v in DEPTH_CODECS.items()}
@@ -100,6 +100,8 @@ class SessionConverter(Recorder):
         from lerobot.configs.video import RGBEncoderConfig
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
         jm = self.jm
+        if not jm.get("frames"):
+            return self._no_frames()
         mc, check = collector_modules()
         root = self._target_dir()
         task = jm.get("task") or self.default_task
@@ -142,6 +144,29 @@ class SessionConverter(Recorder):
         if result["status"] == "completed":
             self._keep_originals(root)
         return result
+
+    def _no_frames(self):
+        """Every cycle was skipped on the Jetson (no video files exist). Keep a failed session that
+        says why, with the uploaded files, instead of failing on a missing mp4."""
+        jm = self.jm
+        skipped = jm.get("skipped") or {}
+        top = max(skipped, key=skipped.get) if skipped else None
+        error = ("녹화된 프레임 없음: " + (f"{skip_hint(top)} (건너뛴 주기 {skipped[top]}개)" if top else "기록된 주기가 없습니다.")
+                 + (f" · Jetson 오류: {'; '.join(jm['errors'])}" if jm.get("errors") else ""))
+        root = self._target_dir()
+        manifest = {"task": jm.get("task") or self.default_task, "status": "failed", **self.manifest_extra,
+                    "fps": self.fps, "recorder": "teleop_server (Jetson-local)", "synthetic": self.synthetic,
+                    "start_unix_ns": jm["start_unix_ns"], "frames": 0, "stop_reason": jm.get("stop_reason"),
+                    "error": error, "elapsed_s": jm.get("elapsed_s"),
+                    "capture_gaps": {"recorded_frames": 0, "skipped": skipped, "events": jm.get("events") or []},
+                    "jetson_upload": "jetson_upload/ (files as received; no frames)"}
+        self._write_manifest(root, manifest)
+        shutil.move(str(self.raw), root / "jetson_upload")
+        return {"session": root.name, "path": str(root), "frames": 0, "status": "failed", "error": error,
+                "stop_reason": jm.get("stop_reason"), "elapsed_s": jm.get("elapsed_s"), "task": manifest["task"],
+                "capture_gaps": {"missing_cycles": 0, "skipped_cycles": sum(skipped.values()),
+                                 "recorded_fraction": 0.0, "skipped": skipped},
+                "source_session": jm["session"]}
 
     def _put(self, s, item):
         while True:

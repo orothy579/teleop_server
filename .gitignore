@@ -3,6 +3,7 @@ __pycache__/
 .cache/
 .venv/
 edge.env
+.public_gateway/
 edge_runtime/
 dataset/
 capture_tools/outputs/

@@ -79,7 +79,6 @@ class ButtonsBrowserTest(unittest.IsolatedAsyncioTestCase):
                 last = await wait_page(c, f"(() => {{ const t = {TEXT.format(sel='#rec-last')};"
                                           " return t.includes('검증 통과') && t.includes('라벨 저장됨') ? t : ''; })()", 60)
                 self.assertIn("검증 통과", last)
-                self.assertEqual(await c.eval(TEXT.format(sel="#btn-labels")), "라벨 보기·수정")
                 await c.screenshot(os.path.join(SHOTS, "8_saved.png"), full=False)
 
                 await c.eval("document.querySelector('#btn-control').click()")

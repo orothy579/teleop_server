@@ -72,7 +72,8 @@ class JetsonRecordings:
         if self.state in ("recording", "finalizing"):
             d.update(session=j.get("session") or self.current, task=j.get("task"), frames=j.get("frames", 0),
                      elapsed_s=j.get("elapsed_s", 0), missing_cycles=0,
-                     skipped_cycles=sum((j.get("skipped") or {}).values()))
+                     skipped_cycles=sum((j.get("skipped") or {}).values()), skipped=j.get("skipped") or {},
+                     stalled=j.get("stalled"))
         elif self.state == "transferring":
             up = j.get("upload") or {}
             d.update(session=up.get("session") or self.current,

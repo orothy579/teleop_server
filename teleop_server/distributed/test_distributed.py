@@ -1,5 +1,6 @@
 import asyncio
 import json
+import queue
 import tempfile
 import time
 import unittest
@@ -15,7 +16,7 @@ from teleop_server.server import parse_args
 from teleop_server.sources.camera import CameraFrame
 from teleop_server.distributed.protocol import encode_packet, decode_packet
 from teleop_server.distributed.edge import Edge
-from teleop_server.distributed.server import create_app, BRIDGE, Bridge
+from teleop_server.distributed.server import create_app, BRIDGE, Bridge, prepare_packet
 from teleop_server.distributed.protocol import LINK_TIMEOUT_S
 
 
@@ -31,6 +32,20 @@ def setUpModule():
 
 
 class CodecTests(unittest.TestCase):
+    def test_live_jpeg_is_forwarded_without_dgx_recompression(self):
+        rgb = np.arange(480*640*3, dtype=np.uint32).reshape(480, 640, 3).astype(np.uint8)
+        frame = CameraFrame(rgb, None, 123, 1, 1, None)
+        for codec in ("jpeg", "png"):
+            packet = encode_packet({"sequence": 1}, [("camera1", frame, {})], codec)
+            _, decoded = decode_packet(packet, with_encoded_rgb=True)
+            _, prepared = prepare_packet(packet, False)
+            jpeg = prepared["camera1"][3]
+            self.assertTrue(jpeg.startswith(b"\xff\xd8"))
+            if codec == "jpeg":
+                self.assertEqual(jpeg, decoded["camera1"][3])
+            else:
+                self.assertNotEqual(jpeg, decoded["camera1"][3])
+
     def test_lossless_rgb_and_metric_depth(self):
         rng = np.random.default_rng(4)
         rgb = rng.integers(0, 256, (480, 640, 3), dtype=np.uint8)
@@ -85,6 +100,58 @@ class CodecTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 decode_packet(bytes(bad))
         self.assertGreater(meta_len, 0)
+
+
+class LivePreviewTests(unittest.TestCase):
+    def test_rgb_stays_full_rate_and_depth_preview_does_not_change_recording_frames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sensors = parse_args(["--cameras", "fake", "--arms", "fake", "--odom", "fake",
+                                  "--fps", "30", "--arm-rate", "30"])
+            edge = Edge(Namespace(dgx="http://127.0.0.1:1", token="test", rgb_codec="jpeg", depth_codec="lz4",
+                                  encode_workers=3, window=2, queue=4, depth_mode="raw", record_dir=tmp,
+                                  rgb_crf=18, rgb_preset="superfast", preview_hz_recording=30,
+                                  preview_depth_hz=10, upload_mbps=1000), sensors)
+            edge.connected = True
+            original = CameraFrame(np.zeros((4, 4, 3), np.uint8), np.ones((4, 4), np.float32),
+                                   time.time_ns(), 1, 1, .3)
+            for camera in edge.cameras:
+                camera._latest = camera._latest_paired = original
+            try:
+                for state in ("idle", "recording"):
+                    edge.recorder.state = state
+                    depth_packets = 0
+                    for _ in range(30):
+                        edge.stream_cycle()
+                        meta, frames = edge.pending.get_nowait()
+                        self.assertEqual(len(frames), 3)
+                        expected_shape = (4, 4, 3) if state == "idle" else (2, 2, 3)
+                        self.assertTrue(all(frame.rgb.shape == expected_shape for _, frame, _ in frames))
+                        has_depth = all(frame.depth is original.depth for _, frame, _ in frames)
+                        depth_packets += has_depth
+                        self.assertTrue(has_depth or all(frame.depth is None for _, frame, _ in frames))
+                    self.assertEqual(depth_packets, 10)
+                    self.assertEqual(edge.sequence, 30 if state == "idle" else 60)
+                    self.assertTrue(all(camera.latest_frame(paired=True).depth is original.depth
+                                        for camera in edge.cameras))
+                    self.assertTrue(all(camera.latest_frame(paired=True).rgb is original.rgb
+                                        for camera in edge.cameras))
+
+                writer_queue = queue.Queue()
+                for _ in range(16):
+                    writer_queue.put(object())
+                edge.recorder.current = SimpleNamespace(writers={"camera1": SimpleNamespace(queue=writer_queue)})
+                start = edge.sequence
+                for _ in range(30):
+                    edge.stream_cycle()
+                    while not edge.pending.empty():
+                        edge.pending.get_nowait()
+                self.assertTrue(edge.writer_backoff)
+                self.assertEqual(edge.sequence-start, 10)
+                for _ in range(12):
+                    writer_queue.get_nowait()
+                self.assertEqual(edge.preview_stride(), 1)
+            finally:
+                edge.encoder.shutdown(wait=False, cancel_futures=True)
 
 
 class CameraSamplingTests(unittest.TestCase):
@@ -240,7 +307,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.edge = Edge(Namespace(dgx=f"http://127.0.0.1:{self.proxy.port}", token="test-secret", rgb_codec="jpeg", depth_codec="lz4",
                                    encode_workers=3, window=2, queue=4, depth_mode="raw",
                                    record_dir=self.jetson_tmp.name, rgb_crf=18,
-                                   rgb_preset="superfast", preview_hz_recording=10, upload_mbps=1000), sensors)
+                                   rgb_preset="superfast", preview_hz_recording=self.FPS,
+                                   preview_depth_hz=10, upload_mbps=1000), sensors)
         self.edge.recorder.min_free_bytes = 0
         self.task = asyncio.create_task(self.edge.run())
         self.client = ClientSession()
@@ -473,6 +541,87 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         report = await asyncio.to_thread(validate, root)
         self.assertEqual(report["depth_frames"], {f"camera{i}": result["frames"] for i in range(1, 4)})
 
+    async def test_record_start_refused_without_base_odometry(self):
+        """SLATE off: no odometry at all, so every cycle would be skipped. Refuse with the reason."""
+        if self.FPS != 10:
+            self.skipTest("does not depend on the frame rate")
+        bridge = self.app[BRIDGE]
+        await self.until(lambda: bridge.received >= 5)
+        await bridge.call("control_start")
+        await self.until(lambda: bridge.sources["arms"].state == "running")
+        cap, original = self.edge.base_capture, self.edge.base_capture.snapshot
+        cap.snapshot = lambda drain=True: dict(original(drain), odom=None)
+        try:
+            async with self.client.post(self.url+"/api/record", json={"action": "start"}) as r:
+                body = await r.json()
+            self.assertEqual(r.status, 409, body)
+            self.assertIn("SLATE", body["error"])
+            self.assertEqual(self.edge.recorder.state, "idle")
+            self.assertEqual(list(self.edge.recorder.root.iterdir()), [])
+        finally:
+            del cap.snapshot
+
+    async def test_recording_without_stored_frames_is_reported_not_crashed(self):
+        """Odometry stops after start: the UI status says why nothing is stored, and the empty
+        session ends as a clear failure (no mp4 exists) instead of a conversion crash."""
+        if self.FPS != 10:
+            self.skipTest("does not depend on the frame rate")
+        import teleop_server.distributed.local_recorder as lr
+        bridge = self.app[BRIDGE]
+
+        async def stalled_is_shown(bridge, name):
+            await self.until(lambda: (bridge.recorder.status().get("stalled") or {}).get("reason") == "odometry too old",
+                             timeout=5)
+            self.assertIn("SLATE", bridge.recorder.status()["stalled"]["hint"])
+        with patch.object(lr, "MAX_BASE_AGE_NS", -1):  # every cycle: "odometry too old"
+            name, result = await self._record(0.5, stalled_is_shown)
+        self.assertEqual((result["status"], result["frames"]), ("failed", 0), result)
+        self.assertIn("녹화된 프레임 없음", result["error"])
+        self.assertIn("SLATE", result["error"])
+        self.assertNotIn("FileNotFoundError", result["error"])
+        root = Path(result["path"])
+        manifest = json.loads((root/"session.json").read_text())
+        self.assertEqual((manifest["status"], manifest["source_session"]), ("failed", name))
+        self.assertGreater(manifest["capture_gaps"]["skipped"]["odometry too old"], 0)
+        self.assertTrue((root/"jetson_upload"/"manifest.json").is_file())
+        self.assertEqual(list((Path(self.tmp.name)/".incoming").iterdir()), [], "nothing left to re-convert")
+        self.assertFalse((self.edge.recorder.root/name).exists())
+        async with self.client.get(self.url+"/api/sessions") as r:  # listed, so it can still be labelled
+            self.assertIn(root.name, [x["session"] for x in (await r.json())["sessions"]])
+
+    async def test_slate_driver_restart_button(self):
+        """Web button -> DGX -> Jetson: restarts the SLATE driver's systemd user service."""
+        if self.FPS != 10:
+            self.skipTest("does not depend on the frame rate")
+        bridge = self.app[BRIDGE]
+        await self.until(lambda: bridge.received >= 3 and bridge.base_status.get("driver_restart"))
+        calls = []
+
+        class Proc:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            return Proc()
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            async with self.client.post(self.url+"/api/base", json={"action": "restart_driver"}) as r:
+                body = await r.json()
+            self.assertEqual((r.status, body.get("slate")), (200, "simulated"), body)
+            self.assertEqual(calls, [], "fake sensors must never touch systemd")
+            self.edge.fake_base = False  # the real Jetson path
+            async with self.client.post(self.url+"/api/base", json={"action": "restart_driver"}) as r:
+                body = await r.json()
+            self.assertEqual((r.status, body.get("slate")), (200, "restarting"), body)
+            self.assertEqual(calls, [("systemctl", "--user", "restart", "--no-block", "teleop-jetson-slate.service")])
+            Proc.returncode = 1
+            async with self.client.post(self.url+"/api/base", json={"action": "restart_driver"}) as r:
+                body = await r.json()
+            self.assertEqual(r.status, 409)
+            self.assertIn("재시작 실패", body["error"])
+
     async def test_upload_failure_keeps_jetson_copy_and_retries(self):
         bridge = self.app[BRIDGE]
         recordings, calls, kept = bridge.recorder, [0], []
@@ -520,6 +669,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: bridge.received >= 5)
         await bridge.call("control_start")
         await self.until(lambda: bridge.sources["arms"].state == "running")
+        self.edge.reduced_every = 3  # explicit lower-rate preview option
 
         async def rate():
             start, t0 = bridge.received, asyncio.get_running_loop().time()

@@ -1,0 +1,15 @@
+[Unit]
+Description=Authenticated public HTTPS gateway for robot web app
+After=network-online.target teleop-dgx.service
+Wants=network-online.target teleop-dgx.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/midbar/ws/teleop_server
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/midbar/ws/lerobot_trossen/.venv/bin/python -B -m teleop_server.public_gateway serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

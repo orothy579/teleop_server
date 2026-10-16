@@ -13,13 +13,12 @@
 
 녹화는 프로젝트 루트의 `dataset/`에 녹화 시작 시각 이름으로 쌓인다.
 DGX 분산 서비스도 같은 `dataset/`에 Jetson에서 받은 세션을 변환해 저장한다.
-현재 실행 환경은 `/home/midbar/ws/lerobot_trossen/.venv`를 재사용한다. 코드와 데이터는 이 프로젝트에서 관리한다.
+실행 환경은 프로젝트의 Python 가상환경을 사용한다. 코드와 데이터는 이 프로젝트에서 관리한다.
 
 프로젝트 구성: `teleop_server/`는 서버·Jetson edge·녹화/검증 코드, `capture_tools/`는 독립 수집 도구,
 `dataset/`은 DGX가 받은 세션이다. `dataset/`, `edge.env`, `.cache/`는 Git에서 제외한다.
-현재 DGX와 Jetson의 소스 디렉터리는 배포를 위해 복사한 상태이며 Git 저장소는 아직 만들지 않았다.
-이후 같은 저장소를 양쪽 `~/ws/teleop_server`에서 Git으로 동기화하면 된다.
-DGX에는 `teleop_jetson` 사본이 필요하지 않다. Jetson의 `~/ws/teleop_jetson`은
+DGX와 Jetson의 소스 디렉터리는 같은 Git 저장소에서 동기화한다.
+DGX에는 `teleop_jetson` 사본이 필요하지 않다. Jetson의 `~/teleop_jetson`은
 가상환경, SLATE 설치, 원본 녹화 파일과 토큰 설정을 보관하는 장비 전용 디렉터리다.
 
 이 앱과 `mobile_capture.py`는 같은 팔과 카메라를 동시에 열 수 없다. 서비스가 켜져 있으면 카메라를 서비스가 쓰고 있다.
@@ -32,10 +31,10 @@ HTTP API와 WebSocket은 각각 로그인 쿠키를 확인하고, 사용자는 �
 로그인한 모든 사용자는 로봇 제어 버튼을 사용할 수 있으므로 실제 운전자는 서로 조율한다.
 
 ```bash
-cd /home/midbar/ws/teleop_server
-/home/midbar/ws/lerobot_trossen/.venv/bin/python -m teleop_server.public_gateway add-user alice
-/home/midbar/ws/lerobot_trossen/.venv/bin/python -m teleop_server.public_gateway list-users
-/home/midbar/ws/lerobot_trossen/.venv/bin/python -m teleop_server.public_gateway remove-user alice
+cd /path/to/teleop_server
+python -m teleop_server.public_gateway add-user operator1
+python -m teleop_server.public_gateway list-users
+python -m teleop_server.public_gateway remove-user operator1
 systemctl --user status teleop-public
 ```
 
@@ -71,10 +70,10 @@ bash teleop_server/deploy/install.sh                   # 다시 설치 (서비�
 직접 실행할 때는 서비스를 멈춘 뒤 아래처럼 한다.
 
 ```bash
-cd /home/midbar/ws/teleop_server
+cd /path/to/teleop_server
 source /opt/ros/jazzy/setup.bash
 export ROS_LOG_DIR=/tmp/lerobot-ros-logs
-/home/midbar/ws/lerobot_trossen/.venv/bin/python -m teleop_server.server --arms teleop
+python -m teleop_server.server --arms teleop
 ```
 
 | 옵션 | 기본값 | 설명 |
@@ -242,21 +241,21 @@ Jetson(`teleop-jetson` 서비스, `edge.py`)이 카메라·팔·베이스를 열
 
 ```bash
 # Jetson (즉시 + 재부팅 후 유지)
-sudo iw dev wlP1p1s0 set power_save off
+sudo iw dev <wifi-interface> set power_save off
 printf '[connection]\nwifi.powersave = 2\n' | sudo tee /etc/NetworkManager/conf.d/zz-teleop-wifi-powersave-off.conf
 printf 'options rtl8822ce rtw_power_mgnt=0 rtw_ips_mode=0\n' | sudo tee /etc/modprobe.d/rtl8822ce-teleop.conf
 sudo nmcli general reload conf
 # DGX
-sudo iw dev wlP9s9 set power_save off
+sudo iw dev <wifi-interface> set power_save off
 printf '[connection]\nwifi.powersave = 2\n' | sudo tee /etc/NetworkManager/conf.d/zz-teleop-wifi-powersave-off.conf
 sudo nmcli general reload conf
 # 확인: 둘 다 "Power save: off"
-iw dev wlP1p1s0 get power_save   # DGX는 wlP9s9
+iw dev <wifi-interface> get power_save   # DGX는 <wifi-interface>
 ```
 
 ### AI 제어 (2026-10-13)
 
-제어 카드의 **AI 제어…**는 `/home/midbar/ws/inference/`에서 `inference.yaml`이 있는 모델 폴더를 찾아 목록으로 보여 준다.
+제어 카드의 **AI 제어…**는 `<inference-directory>/`에서 `inference.yaml`이 있는 모델 폴더를 찾아 목록으로 보여 준다.
 
 - 모델을 **모델 로드**로 한 번 불러 두면, 그다음부터 **AI 제어 시작**과 **AI 정지**가 바로 된다.
 - 워커는 systemd 사용자 서비스 `teleop-inference-<모델>`로 실행되므로, 이 서버를 다시 시작해도 모델이 메모리에 남는다.
@@ -306,7 +305,7 @@ iw dev wlP1p1s0 get power_save   # DGX는 wlP9s9
   - `GET /api/ai/bundle/<모델>?run=<파일>&run=…&error=<파일>…` (zip)
 
   코드는 `ai_control.py`와 `static/ai.js`에 있다.
-- 모델 추가 방법과 워커 API는 `/home/midbar/ws/inference/README.md`에 있다.
+- 모델 추가 방법과 워커 API는 `<inference-directory>/README.md`에 있다.
 
 ### 데이터셋 목록 (2026-10-12)
 
@@ -342,7 +341,7 @@ iw dev wlP1p1s0 get power_save   # DGX는 wlP9s9
 - 세션마다 tar로 `받을폴더/.incoming/<세션>`에 보낸다. 모든 파일의 SHA-256을 원본과 비교한 뒤에만 `받을폴더/<세션>`으로 옮긴다. 받는 쪽에 같은 세션이 이미 있으면 건너뛰고, 받는 쪽 데이터는 덮어쓰거나 지우지 않는다. 받는 쪽에는 tar·sha256sum·find·xargs만 있으면 된다(rsync 불필요).
 - 진행 상황(세션별 상태, 속도, 남은 시간)은 팝업과 상단 배지에 보인다. 팝업을 닫아도 전송은 계속되며, **전송 취소**로 멈출 수 있다. 보내는 중인 세션은 삭제할 수 없다.
 - 업로드 속도 제한 기본값은 100 Mbit/s(0 = 제한 없음)다. DGX Wi-Fi가 Jetson 연결과 같으므로 로봇을 조작하는 동안에는 제한을 둔다.
-- 2026-10-12 bai-vscode(dropbear SSH, Ubuntu 24.04)로 시험했다. 60 MB 시험 세션이 로그인과 검증을 포함해 1.8초(약 266 Mbit/s)에 도착했다. 시험 폴더는 지웠다.
+- 전송 성능은 네트워크와 저장 장치에 따라 달라지므로 실제 환경에서 확인한다.
 
 ### SLATE(베이스) 전원과 odometry (2026-10-12)
 
@@ -355,7 +354,7 @@ iw dev wlP1p1s0 get power_save   # DGX는 wlP9s9
 
 녹화는 Wi-Fi에 의존하지 않는다. 녹화 중 Wi-Fi가 끊기면 팔 제어는 안전을 위해 멈추지만 녹화는 계속되고, 제어가 멈춘 주기 수와 이벤트가 기록된다. 녹화는 녹화 종료 또는 제어 종료 버튼으로만 끝난다.
 
-1. **녹화 중 (Jetson)**: 팔 제어 주기(30 Hz, Jetson 시계)마다 한 프레임을 쓴다. 카메라마다 RGB는 H.264 mp4(640×480, libx264 superfast crf 18)로, depth는 카메라 원본 uint16을 무손실 압축(u16 행 차분 + lz4)해 쓴다. 팔·베이스·카메라 메타데이터는 `cycles.jsonl`에, 베이스 원본 메시지는 `base_raw.jsonl`에 쓴다. 저장 위치는 `~/ws/teleop_jetson/recordings/<세션>/`이다.
+1. **녹화 중 (Jetson)**: 팔 제어 주기(30 Hz, Jetson 시계)마다 한 프레임을 쓴다. 카메라마다 RGB는 H.264 mp4(640×480, libx264 superfast crf 18)로, depth는 카메라 원본 uint16을 무손실 압축(u16 행 차분 + lz4)해 쓴다. 팔·베이스·카메라 메타데이터는 `cycles.jsonl`에, 베이스 원본 메시지는 `base_raw.jsonl`에 쓴다. 저장 위치는 `~/workspace/teleop_jetson/recordings/<세션>/`이다.
 2. **마무리**: 파일을 닫고 SHA-256을 계산한다(60초 녹화에 약 4초).
 3. **전송**: Jetson이 파일마다 크기와 SHA-256을 붙여 DGX로 올린다. 제어 링크를 위해 200 Mbit/s로 제한한다(`--upload-mbps`). DGX가 모든 파일을 확인한 뒤에만 Jetson 사본을 지운다. 실패하면 파일을 남기고 5초마다 다시 보낸다.
 4. **변환·검증 (DGX)**: 기존 녹화와 같은 세션 형식으로 바꾸고 검증한다. 성공하면 `dataset/.incoming/`의 원본을 지우고, 실패하면 남긴다. DGX가 다시 시작되면 `.incoming`에 확인된 세션을 이어서 변환한다.
@@ -366,7 +365,7 @@ iw dev wlP1p1s0 get power_save   # DGX는 wlP9s9
 
 | Jetson `edge.py` 옵션 | 기본값 | 내용 |
 |---|---|---|
-| `--record-dir` | `~/ws/teleop_jetson/recordings` | Jetson 녹화 위치 (여유 20 GB 미만이면 녹화 거부) |
+| `--record-dir` | `~/workspace/teleop_jetson/recordings` | Jetson 녹화 위치 (여유 20 GB 미만이면 녹화 거부) |
 | `--rgb-crf`, `--rgb-preset` | 18, superfast | RGB mp4 화질과 CPU 사용량 |
 | `--camera-sampling` | buffered | 위 설명 |
 | `--preview-hz-recording` | 30 | 녹화 중 실시간 RGB 화면 목표 Hz (writer가 밀리면 10 Hz로 자동 조절) |
@@ -375,17 +374,17 @@ iw dev wlP1p1s0 get power_save   # DGX는 wlP9s9
 
 ### 장비별 코드 위치와 배포
 
-| | DGX Spark (`192.168.0.104`) | Jetson (`192.168.0.22`, `ssh midbar@192.168.0.22`) |
+| | DGX Spark (`<DGX_HOST>`) | Jetson (`<JETSON_HOST>`, `ssh <user>@<JETSON_HOST>`) |
 |---|---|---|
 | 역할 | 웹서버 8081, 실시간 화면, 세션 수신·변환·검증 | 센서, 팔 추종 제어, 베이스, 녹화, 송신 (웹서버 없음) |
-| 코드 | 프로젝트: `~/ws/teleop_server` | 소스: `~/ws/teleop_server` (Git 동기화 대상)<br>실행본: `~/ws/teleop_server/edge_runtime/teleop_server` (실제로 쓰는 18개 파일) |
+| 코드 | 프로젝트: `~/workspace/teleop_server` | 소스: `~/workspace/teleop_server` (Git 동기화 대상)<br>실행본: `~/workspace/teleop_server/edge_runtime/teleop_server` (실제로 쓰는 18개 파일) |
 | 서비스 | `teleop-dgx` (`distributed/deploy/run_dgx.sh`) | `teleop-jetson` (`run_edge.sh`), `teleop-jetson-slate` (`run_slate.sh`) |
-| 실행 환경 | `lerobot_trossen/.venv`, 이 프로젝트의 `edge.env` (토큰) | `~/ws/teleop_jetson/.venv`, `slate_ws`, `packages/` (팔 드라이버), `edge.env` (토큰) |
+| 실행 환경 | `lerobot_trossen/.venv`, 이 프로젝트의 `edge.env` (토큰) | `~/workspace/teleop_jetson/.venv`, `slate_ws`, `packages/` (팔 드라이버), `edge.env` (토큰) |
 
 실행본에 들어가는 파일은 `distributed/deploy/jetson_runtime_files.txt`에 적혀 있다. 코드를 바꾸면 이렇게 배포한다.
 
-1. Jetson의 `~/ws/teleop_server` 소스를 Git으로 업데이트한다.
-2. Jetson에서 `bash ~/ws/teleop_server/teleop_server/distributed/deploy/build_jetson_runtime.sh`를 실행해 실행본을 다시 만든다.
+1. Jetson의 `~/workspace/teleop_server` 소스를 Git으로 업데이트한다.
+2. Jetson에서 `bash ~/workspace/teleop_server/teleop_server/distributed/deploy/build_jetson_runtime.sh`를 실행해 실행본을 다시 만든다.
 3. Jetson에서 `systemctl --user daemon-reload && systemctl --user restart teleop-jetson`을 실행한다.
 
 edge가 새 모듈을 import하게 되면 목록에도 추가해야 한다. 빠진 파일이 있으면 실행본에서 시작할 때 `ModuleNotFoundError`가 난다.
@@ -440,17 +439,17 @@ dataset/<session>/          세션 이름 = Jetson 녹화 시작 시각 (KST)
 ## 테스트
 
 ```bash
-cd /home/midbar/ws/teleop_server
+cd /path/to/teleop_server
 # 하드웨어 없이 (합성 센서 + 헤드리스 Chrome). 서비스가 켜져 있어도 된다.
-/home/midbar/ws/lerobot_trossen/.venv/bin/python -m unittest discover -s teleop_server/tests -t . -p 'test_*.py'
+python -m unittest discover -s teleop_server/tests -t . -p 'test_*.py'
 
 # Jetson → DGX 분산 모드 (한 프로세스 안에서 가짜 센서로 Jetson 녹화 → 전송 → 변환 → 검증,
 # 업로드 실패 재시도, 녹화 중 Wi-Fi 끊김, 프레임 선택, depth 코덱)
-/home/midbar/ws/lerobot_trossen/.venv/bin/python -m unittest teleop_server.distributed.test_distributed
+python -m unittest teleop_server.distributed.test_distributed
 
 # 실제 장비. 먼저 systemctl --user stop teleop-server. TELEOP_ARMS=1이면 팔이 움직인다.
 source /opt/ros/jazzy/setup.bash; export ROS_LOG_DIR=/tmp/lerobot-ros-logs
-TELEOP_HW=1 TELEOP_ROS=1 TELEOP_ARMS=1 /home/midbar/ws/lerobot_trossen/.venv/bin/python -m unittest discover -s teleop_server/tests -t . -p 'test_*.py'
+TELEOP_HW=1 TELEOP_ROS=1 TELEOP_ARMS=1 python -m unittest discover -s teleop_server/tests -t . -p 'test_*.py'
 ```
 
 | 파일 | 내용 |
@@ -484,7 +483,4 @@ TELEOP_HW=1 TELEOP_ROS=1 TELEOP_ARMS=1 /home/midbar/ws/lerobot_trossen/.venv/bin
 
 - depth를 함께 녹화하면 녹화 중 실시간 화면의 카메라 프레임 간격이 최대 약 120 ms까지 늘어난다. 저장되는 데이터의 카메라 나이는 34 ms 이하였다.
 - 녹화를 멈춘 뒤 인코딩하는 동안 실시간 화면이 최대 약 0.4초 멈춘다. 긴 녹화는 저장에 수 분 걸릴 수 있다.
-- 2026-10-07 18:00경 서비스를 처음 시작했을 때 RGB와 depth 짝 불일치가 11~37%, 카메라가 18~27 fps로 떨어졌다. 서비스를 다시 시작하자 사라졌고 원인은 확인하지 못했다. 이제 짝 불일치가 10%를 넘으면 녹화를 막고, 20%를 넘는 상태가 이어지면 그 카메라를 자동으로 다시 연다.
 - 팔 컨트롤러 CAN 오류처럼 프로세스가 강제 종료되면 진행 중인 에피소드는 저장되지 않는다. 서비스는 자동으로 다시 시작되고, 팔은 버튼을 누를 때까지 연결되지 않는다.
-- 2026-10-06 21:14경 카메라와 SLATE USB 시리얼이 함께 USB에서 사라져 전원을 다시 켰다. 원인은 확인하지 못했다.
-- 첫 통합 실행 두 번에서 왼쪽 팔로워 컨트롤러가 연결 설정 중 TCP를 끊었다. 원인은 확인하지 못했다.
